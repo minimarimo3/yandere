@@ -191,6 +191,9 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
 - activity/summaryは事実ベース。分からないことは断定しない。
 - notification_hintは、実際の台詞ではなく「何についてどう声をかけたいか」を短く書く。
 - 次のキーをすべて含むJSONオブジェクトだけを返す: activity, working, focus_level, summary, active_app, mood, should_speak, speak_reason, intent, notification_hint。
+- 入力イベントが0でも、それだけで離席・非作業とは判断しない。「入力イベントが発生していない」という事実を、ユーザーが何もしていない証拠として扱わない。
+- ドキュメント閲覧、コードレビュー、調査、動画・資料の確認などは、キーボード入力がなくても作業であり得る。
+- working と focus_level は、入力数だけでなく、画面内容、開いているアプリ、ウィンドウタイトル、スクロール、直前の観察履歴を総合して判断する。
 
 直近の観察履歴（ローカル時刻）:
 {}

@@ -105,7 +105,7 @@ pub async fn ensure_daemon(client: &Client, base: &str, data_dir: &Path) -> Resu
         .with_context(|| format!("open {}", log_path.display()))?;
     let stderr = stdout.try_clone()?;
 
-    let args = "record --disable-audio --app-context memory --disable-keyboard-capture=false --disable-clipboard-capture=true --capture-scroll=true --prioritize-input-latency --disable-meeting-detector --disable-telemetry --retention-days 14 --retention-mode media";
+    let args = "record --disable-audio --app-context memory --disable-keyboard-capture=false --disable-clipboard-capture=true --capture-scroll=true --prioritize-input-latency --disable-meeting-detector --disable-telemetry --retention-days 14 --retention-mode media --idle-capture-interval-ms 30000";
     let script = format!(
         "if command -v screenpipe >/dev/null 2>&1; then exec screenpipe {args}; else exec npx -y screenpipe@latest {args}; fi"
     );

@@ -86,6 +86,7 @@ screenpipe record \
   --disable-meeting-detector \
   --disable-telemetry \
   --retention-days 14 \
+  --idle-capture-interval-ms 30000 \
   --retention-mode media
 ```
 
