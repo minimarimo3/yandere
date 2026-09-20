@@ -1,4 +1,4 @@
-use crate::{logging, models::{ActivitySnapshot, AppActivity}};
+use crate::{logging, models::{ActivitySnapshot, AppActivity, ScreenpipeHealth}};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
@@ -78,9 +78,109 @@ async fn json_response(req: RequestBuilder, label: &str) -> Result<Value> {
     Err(anyhow!("{label}: retries exhausted"))
 }
 
+pub async fn health_details(client: &Client, base: &str) -> ScreenpipeHealth {
+    let url = format!("{}/health", base.trim_end_matches('/'));
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return ScreenpipeHealth {
+                detail: format!("screenpipe /health に接続できません: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+
+    // Any HTTP response proves that a daemon owns the endpoint. Keep
+    // reachability separate from capture quality so a degraded recorder does
+    // not make the companion accidentally start a second screenpipe process.
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            return ScreenpipeHealth {
+                reachable: true,
+                detail: format!("screenpipe /health の応答を読めません: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+
+    if !status.is_success() {
+        return ScreenpipeHealth {
+            reachable: true,
+            detail: format!("screenpipe /health: HTTP {status}: {}", body.trim()),
+            ..Default::default()
+        };
+    }
+
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            return ScreenpipeHealth {
+                reachable: true,
+                detail: format!("screenpipe /health のJSONを解釈できません: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+
+    let frame_status = value.get("frame_status").and_then(Value::as_str).unwrap_or("").to_string();
+    let vision_reason = value.get("vision_reason").and_then(Value::as_str).unwrap_or("").to_string();
+    let screen_capture_ok = vision_reason == "ok"
+        || (vision_reason.is_empty() && frame_status == "ok");
+
+    let ui = value.get("ui_recorder");
+    let ui_recorder_running = ui
+        .and_then(|v| v.get("running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let input_monitoring_ok = ui
+        .and_then(|v| v.get("input_tap_running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let events_inserted = ui
+        .and_then(|v| v.get("events_inserted"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ui_mode = ui
+        .and_then(|v| v.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // screenpipe cannot run the UI recorder without Accessibility permission.
+    // The tree-walker counter is an additional positive signal for versions
+    // where the recorder may be starting up or running in a reduced mode.
+    let accessibility_walks = value
+        .pointer("/accessibility/walks_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let accessibility_ok = ui_recorder_running || accessibility_walks > 0;
+
+    let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+    let detail = if message.is_empty() {
+        if !vision_reason.is_empty() { format!("vision: {vision_reason}") } else { "screenpipe is responding".to_string() }
+    } else {
+        message.to_string()
+    };
+
+    ScreenpipeHealth {
+        reachable: true,
+        screen_capture_ok,
+        accessibility_ok,
+        input_monitoring_ok,
+        ui_recorder_running,
+        events_inserted,
+        frame_status,
+        vision_reason,
+        ui_mode,
+        screenpipe_version: value.get("version").and_then(Value::as_str).map(|s| s.to_string()),
+        detail,
+    }
+}
+
 pub async fn health(client: &Client, base: &str) -> bool {
-    client.get(format!("{}/health", base.trim_end_matches('/')))
-        .send().await.map(|r| r.status().is_success()).unwrap_or(false)
+    health_details(client, base).await.reachable
 }
 
 fn local_screenpipe_url(base: &str) -> bool {

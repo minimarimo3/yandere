@@ -184,3 +184,10 @@ cargo tauri build
 - Tauri official autostart pluginを追加し、packaged `.app` の初回起動時にmacOSログイン自動起動を登録。
 - screenpipeが停止していれば推奨オプション付きで自動起動。手動起動済みなら重複起動しない。
 - UI外枠のスクロールを廃止。チャット履歴・設定・日記本文の内部スクロールだけを残した。
+
+
+## v0.1.13
+
+- Settings now shows detailed screenpipe health: screen capture, Accessibility, Input Monitoring, UI recorder state, and inserted input event count.
+- Chat/proactive messages use Gemini 3.7 Flash → 3.6 Flash → 3.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite, falling back only on HTTP 429 rate/quota exhaustion.
+- Keeps the 30-second idle capture floor (`--idle-capture-interval-ms 30000`).

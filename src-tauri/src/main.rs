@@ -9,7 +9,7 @@ mod screenpipe;
 
 use anyhow::Result;
 use chrono::{Local, Utc};
-use models::{BootstrapData, ChatMessage, DiaryEntry};
+use models::{BootstrapData, ChatMessage, DiaryEntry, ScreenpipeHealth};
 use reqwest::Client;
 use std::{
     path::PathBuf,
@@ -52,9 +52,18 @@ async fn bootstrap(state: State<'_, Arc<AppState>>) -> Result<BootstrapData, Str
     let last_observation = db::recent_observations(&state.db_path, 1).map_err(err)?.pop();
     let date = Local::now().format("%Y-%m-%d").to_string();
     let today_diary = db::get_diary(&state.db_path, &date).map_err(err)?;
-    // Keep UI refreshes cheap: a bootstrap happens after observations and chat
-    // events, so probing /search here would create unnecessary search pressure.
-    let screenpipe_ok = if rhythm.sleeping { false } else { screenpipe::health(&state.http, &cfg.screenpipe_url).await };
+    // /health is cached by screenpipe and does not touch the heavier /search
+    // path. Surface individual permission/capture states so a rebuilt macOS
+    // app cannot silently lose TCC permissions while still looking "healthy".
+    let screenpipe_health = if rhythm.sleeping {
+        ScreenpipeHealth {
+            detail: "睡眠中のためscreenpipeの状態確認を停止しています。".into(),
+            ..Default::default()
+        }
+    } else {
+        screenpipe::health_details(&state.http, &cfg.screenpipe_url).await
+    };
+    let screenpipe_ok = screenpipe_health.observation_ready();
     let log_path = logging::path().unwrap_or_else(|| state.data_dir.join("companion.log"));
     let screenpipe_log_path = state.data_dir.join("screenpipe.log");
     Ok(BootstrapData {
@@ -63,11 +72,25 @@ async fn bootstrap(state: State<'_, Arc<AppState>>) -> Result<BootstrapData, Str
         last_observation,
         today_diary,
         screenpipe_ok,
+        screenpipe_health,
         rhythm,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         log_path: log_path.to_string_lossy().into_owned(),
         screenpipe_log_path: screenpipe_log_path.to_string_lossy().into_owned(),
     })
+}
+
+#[tauri::command]
+async fn check_screenpipe_health(state: State<'_, Arc<AppState>>) -> Result<ScreenpipeHealth, String> {
+    let cfg = config::load(&state.data_dir).map_err(err)?;
+    let rhythm_status = rhythm::status(&state.data_dir).map_err(err)?;
+    if rhythm_status.sleeping {
+        return Ok(ScreenpipeHealth {
+            detail: "睡眠中のためscreenpipeの状態確認を停止しています。".into(),
+            ..Default::default()
+        });
+    }
+    Ok(screenpipe::health_details(&state.http, &cfg.screenpipe_url).await)
 }
 
 #[tauri::command]
@@ -284,7 +307,7 @@ fn main() {
             tauri::async_runtime::spawn(agent::run_loop(app_handle, state));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![bootstrap, send_message, save_config, generate_diary, observe_now, quit_all])
+        .invoke_handler(tauri::generate_handler![bootstrap, check_screenpipe_health, send_message, save_config, generate_diary, observe_now, quit_all])
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {

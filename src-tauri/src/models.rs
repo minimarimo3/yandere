@@ -87,6 +87,32 @@ pub struct RhythmStatus {
     pub wake_at_display: String,
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScreenpipeHealth {
+    pub reachable: bool,
+    pub screen_capture_ok: bool,
+    pub accessibility_ok: bool,
+    pub input_monitoring_ok: bool,
+    pub ui_recorder_running: bool,
+    pub events_inserted: u64,
+    pub frame_status: String,
+    pub vision_reason: String,
+    pub ui_mode: String,
+    pub screenpipe_version: Option<String>,
+    pub detail: String,
+}
+
+impl ScreenpipeHealth {
+    pub fn observation_ready(&self) -> bool {
+        self.reachable
+            && self.screen_capture_ok
+            && self.accessibility_ok
+            && self.input_monitoring_ok
+            && self.ui_recorder_running
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapData {
     pub config: crate::config::AppConfig,
@@ -94,6 +120,7 @@ pub struct BootstrapData {
     pub last_observation: Option<StoredObservation>,
     pub today_diary: Option<DiaryEntry>,
     pub screenpipe_ok: bool,
+    pub screenpipe_health: ScreenpipeHealth,
     pub rhythm: RhythmStatus,
     pub app_version: String,
     pub log_path: String,

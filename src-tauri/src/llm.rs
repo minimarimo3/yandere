@@ -268,7 +268,7 @@ pub async fn render_proactive_message(client: &Client, cfg: &AppConfig, decision
 直近の会話（PCローカル時刻）: {}"#,
         cfg.persona, local_time_label_now(), decision.summary, decision.intent, decision.notification_hint,
         PROACTIVE_BEHAVIOR_EXAMPLES, serde_json::to_string(&messages)?);
-    gemini_text(client, cfg, &cfg.chat_model, &prompt, 240, 0.72).await
+    chat_text_with_fallback(client, cfg, &prompt, 240, 0.72).await
 }
 
 pub async fn chat(client: &Client, cfg: &AppConfig, user_text: &str, messages: &[ChatMessage], observations: &[StoredObservation]) -> Result<String> {
@@ -302,7 +302,7 @@ PC観察は「知っている背景」であって「毎回言及すべき話題
 通常は1〜3文で自然に返してください。毎回質問で終えなくて構いません。"#,
         cfg.persona, local_time_label_now(), cfg.user_name, cfg.companion_name, CHAT_BEHAVIOR_EXAMPLES,
         serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?, user_text);
-    gemini_text(client, cfg, &cfg.chat_model, &prompt, 520, 0.72).await
+    chat_text_with_fallback(client, cfg, &prompt, 520, 0.72).await
 }
 
 pub async fn diary(client: &Client, cfg: &AppConfig, date: &str, observations: &[StoredObservation], messages: &[ChatMessage]) -> Result<String> {
@@ -359,7 +359,78 @@ fn extract_gemini_text(res: &Value) -> Option<String> {
     if fallback.trim().is_empty() { None } else { Some(fallback.trim().to_string()) }
 }
 
+fn is_rate_limit_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("HTTP 429")
+        || text.contains("RESOURCE_EXHAUSTED")
+        || text.to_ascii_lowercase().contains("rate limit")
+}
+
+async fn chat_text_with_fallback(
+    client: &Client,
+    cfg: &AppConfig,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String> {
+    let models = [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ];
+
+    let mut rate_errors = Vec::new();
+    for (index, model) in models.iter().enumerate() {
+        match gemini_text_with_policy(
+            client, cfg, model, prompt, max_tokens, temperature, false,
+        ).await {
+            Ok(text) => {
+                if index > 0 {
+                    logging::info(&format!("chat fallback succeeded with {model}"));
+                }
+                return Ok(text);
+            }
+            Err(e) if is_rate_limit_error(&e) => {
+                let message = format!("chat model {model} rate-limited: {e:#}");
+                rate_errors.push(message.clone());
+                if index + 1 < models.len() {
+                    logging::warn(&format!(
+                        "{message}; falling back to {}", models[index + 1]
+                    ));
+                    continue;
+                }
+                logging::error(&message);
+            }
+            Err(e) => {
+                // Authentication errors, malformed requests, safety failures,
+                // etc. should remain visible instead of being hidden by a
+                // model switch. Only quota/rate-limit 429s advance the chain.
+                return Err(e);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "all chat models are rate-limited: {}",
+        rate_errors.join(" | ")
+    ))
+}
+
 async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str, max_tokens: u32, temperature: f32) -> Result<String> {
+    gemini_text_with_policy(client, cfg, model, prompt, max_tokens, temperature, true).await
+}
+
+async fn gemini_text_with_policy(
+    client: &Client,
+    cfg: &AppConfig,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+    retry_rate_limit: bool,
+) -> Result<String> {
     if cfg.gemini_api_key.trim().is_empty() { return Err(anyhow!("Gemini API key is not configured")); }
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model);
     let body = json!({
@@ -394,7 +465,8 @@ async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str
         let response_body = response.text().await.context("read Gemini response")?;
         if !status.is_success() {
             last_error = format!("Gemini API: HTTP {status}: {}", response_body.trim());
-            let transient = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            let transient = status.is_server_error()
+                || (retry_rate_limit && status == StatusCode::TOO_MANY_REQUESTS);
             if transient && attempt < 2 {
                 logging::warn(&format!("{last_error}; retry {}/3", attempt + 1));
                 sleep(Duration::from_secs(1u64 << attempt)).await;

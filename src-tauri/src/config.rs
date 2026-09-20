@@ -34,7 +34,7 @@ impl Default for AppConfig {
             observer_primary_model: "gemma-4-26b-a4b-it".into(),
             observer_fallback_model: "gemma-4-31b-it".into(),
             observer_last_fallback_model: "gemini-3.1-flash-lite".into(),
-            chat_model: "gemini-3.5-flash-lite".into(),
+            chat_model: "gemini-3.7-flash".into(),
             diary_model: "gemini-3.8-flash".into(),
             screenpipe_url: "http://127.0.0.1:3030".into(),
             screenpipe_api_key: String::new(),
@@ -98,6 +98,12 @@ pub fn load(base: &Path) -> Result<AppConfig> {
     if cfg.diary_hour == 21 && cfg.diary_minute == 30 {
         cfg.diary_hour = 22;
         cfg.diary_minute = 30;
+        changed = true;
+    }
+    // v0.1.13 uses Gemini 3.7 Flash as the primary conversational model and
+    // falls back through the lower Flash tiers only when the API returns 429.
+    if cfg.chat_model.trim() != "gemini-3.7-flash" {
+        cfg.chat_model = "gemini-3.7-flash".into();
         changed = true;
     }
     if changed { save(base, &cfg)?; }

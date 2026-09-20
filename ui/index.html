@@ -44,7 +44,19 @@
       <label>あなたの呼び名<input id="cfg-user-name" /></label>
       <label>screenpipe Local API Key<input id="cfg-screenpipe-key" type="password" autocomplete="off" placeholder="sp-…" /></label>
       <label>Gemini API Key<input id="cfg-gemini-key" type="password" autocomplete="off" /></label>
-      <p class="tiny model-chain">観察: Gemma 4 26B → Gemma 4 31B → Gemini 3.1 Flash Lite（自動fallback）</p>
+      <p class="tiny model-chain">観察: Gemma 4 26B → Gemma 4 31B → Gemini 3.1 Flash Lite（自動fallback）<br>会話・通知: Gemini 3.7 Flash → 3.6 Flash → 3.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite（429時のみfallback）</p>
+      <div class="health-card">
+        <div class="health-head">
+          <strong>screenpipe ヘルス</strong>
+          <button id="refresh-health" class="secondary compact" type="button">再チェック</button>
+        </div>
+        <div class="health-row"><span>接続</span><span id="health-daemon" class="health-badge pending">未確認</span></div>
+        <div class="health-row"><span>画面収録</span><span id="health-screen" class="health-badge pending">未確認</span></div>
+        <div class="health-row"><span>Accessibility</span><span id="health-accessibility" class="health-badge pending">未確認</span></div>
+        <div class="health-row"><span>入力監視</span><span id="health-input" class="health-badge pending">未確認</span></div>
+        <div class="health-row"><span>UI recorder</span><span id="health-recorder" class="health-badge pending">未確認</span></div>
+        <p id="health-detail" class="tiny health-detail">権限変更後は美月とscreenpipeを再起動してください。</p>
+      </div>
       <div class="two-col">
         <label>観察間隔（秒）<input id="cfg-interval" type="number" min="30" step="15" /></label>
         <label>通知の最短間隔（分）<input id="cfg-gap" type="number" min="1" /></label>

@@ -24,6 +24,43 @@ function fillConfig(c) {
   $('cfg-gap').value = c.minimum_notification_gap_minutes;
   $('cfg-persona').value = c.persona;
 }
+function setHealthBadge(id, ok, goodText, badText) {
+  const el = $(id);
+  el.className = `health-badge ${ok ? 'good' : 'bad'}`;
+  el.textContent = ok ? goodText : badText;
+}
+function renderScreenpipeHealth(h, sleeping = false) {
+  if (sleeping) {
+    ['health-daemon','health-screen','health-accessibility','health-input','health-recorder'].forEach(id => {
+      const el = $(id);
+      el.className = 'health-badge pending';
+      el.textContent = '睡眠中';
+    });
+    $('health-detail').textContent = h?.detail || '睡眠中のため状態確認を停止しています。';
+    return;
+  }
+
+  h = h || {};
+  setHealthBadge('health-daemon', Boolean(h.reachable), '接続中', '未接続');
+  setHealthBadge('health-screen', Boolean(h.screen_capture_ok), '正常', h.vision_reason || h.frame_status || '要確認');
+  setHealthBadge('health-accessibility', Boolean(h.accessibility_ok), '許可済み', '要許可');
+  setHealthBadge('health-input', Boolean(h.input_monitoring_ok), '許可済み', '要許可');
+
+  const recorder = $('health-recorder');
+  recorder.className = `health-badge ${h.ui_recorder_running ? 'good' : 'bad'}`;
+  recorder.textContent = h.ui_recorder_running
+    ? `稼働中 · ${Number(h.events_inserted || 0).toLocaleString()}件`
+    : '停止中';
+
+  const bits = [];
+  if (h.screenpipe_version) bits.push(`screenpipe ${h.screenpipe_version}`);
+  if (h.ui_mode) bits.push(`UI mode: ${h.ui_mode}`);
+  if (h.detail) bits.push(h.detail);
+  if (!h.accessibility_ok || !h.input_monitoring_ok) {
+    bits.push('権限変更後は美月とscreenpipeを再起動してください。');
+  }
+  $('health-detail').textContent = bits.join(' · ') || '状態を取得しました。';
+}
 function renderBootstrap(d) {
   data = d; fillConfig(d.config); renderMessages(d.messages);
   const sleeping = Boolean(d.rhythm?.sleeping);
@@ -34,8 +71,13 @@ function renderBootstrap(d) {
     $('status-dot').title = `${d.config.companion_name}は睡眠中`;
     $('observation').textContent = 'すやすや寝ています。';
   } else {
-    $('status-dot').className = `status ${d.screenpipe_ok ? 'good' : 'bad'}`;
-    $('status-dot').title = d.screenpipe_ok ? 'screenpipe daemon 稼働中' : 'screenpipe daemon に接続できません';
+    const h = d.screenpipe_health || {};
+    const fullyHealthy = Boolean(d.screenpipe_ok);
+    const reachable = Boolean(h.reachable);
+    $('status-dot').className = `status ${fullyHealthy ? 'good' : (reachable ? 'warn' : 'bad')}`;
+    $('status-dot').title = fullyHealthy
+      ? 'screenpipe / 入力監視ともに正常'
+      : (reachable ? 'screenpipeは動作中ですが権限または入力監視に問題があります' : 'screenpipe daemon に接続できません');
     if (d.last_observation) {
       const o = d.last_observation.decision;
       const date = new Date(d.last_observation.created_at);
@@ -70,6 +112,7 @@ function renderBootstrap(d) {
   $('observe-now').disabled = sleeping;
   $('make-diary').disabled = sleeping;
   $('chat-input').placeholder = sleeping ? `${d.config.companion_name}は寝ています…` : '話しかける…';
+  renderScreenpipeHealth(d.screenpipe_health, sleeping);
 
   if (d.today_diary) $('diary-text').textContent = d.today_diary.text;
   $('app-version').textContent = d.app_version || '-';
@@ -90,6 +133,23 @@ $('chat-form').addEventListener('submit', async (e) => {
   try { const reply = await invoke('send_message', { text }); data.messages.push(reply); renderMessages(data.messages); }
   catch (e) { await reload(); toast(`会話エラー: ${e}`); }
   finally { $('send').disabled = Boolean(data?.rhythm?.sleeping); input.focus(); }
+});
+
+$('refresh-health').addEventListener('click', async () => {
+  const b = $('refresh-health');
+  b.disabled = true;
+  b.textContent = '確認中…';
+  try {
+    const h = await invoke('check_screenpipe_health');
+    if (data) data.screenpipe_health = h;
+    renderScreenpipeHealth(h, Boolean(data?.rhythm?.sleeping));
+    toast('screenpipeの状態を更新しました');
+  } catch(e) {
+    toast(`ヘルス確認エラー: ${e}`);
+  } finally {
+    b.disabled = false;
+    b.textContent = '再チェック';
+  }
 });
 
 $('save-settings').addEventListener('click', async () => {

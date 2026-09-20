@@ -18,6 +18,7 @@ header { flex:0 0 auto; display:flex; justify-content:space-between; align-items
 h1 { margin:2px 0 0; font-size:24px; font-weight:700; }
 .status { width:10px; height:10px; border-radius:50%; box-shadow:0 0 0 4px rgba(0,0,0,.03); }
 .status.good { background:#56a36c; }
+.status.warn { background:#c89a4b; }
 .status.bad { background:#c96d78; }
 .status.sleeping { background:#8f87ad; }
 nav { flex:0 0 auto; display:flex; gap:6px; padding:0 16px 10px; border-bottom:1px solid #eee7eb; }
@@ -55,3 +56,13 @@ button.danger:hover { background:#914552; }
 .app-meta { display:flex; flex-direction:column; gap:6px; border-top:1px solid #eee7eb; padding-top:10px; }
 .app-meta > div { display:grid; grid-template-columns:78px 1fr; gap:8px; align-items:start; font-size:10px; color:#897780; }
 .app-meta code { font-size:9px; line-height:1.45; word-break:break-all; white-space:normal; color:#66545e; }
+
+.health-card { border:1px solid #eadfe5; background:#fcfafb; border-radius:12px; padding:10px 11px; display:flex; flex-direction:column; gap:7px; }
+.health-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:11px; color:#68545f; }
+button.compact { padding:5px 8px; border-radius:8px; font-size:10px; }
+.health-row { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:10px; color:#77656f; }
+.health-badge { display:inline-flex; align-items:center; justify-content:center; min-width:62px; max-width:210px; padding:3px 7px; border-radius:999px; font-size:9px; line-height:1.3; text-align:right; }
+.health-badge.good { background:#e6f2e9; color:#3f7650; }
+.health-badge.bad { background:#f6e5e8; color:#9a4855; }
+.health-badge.pending { background:#eeeaf2; color:#746a80; }
+.health-detail { margin:2px 0 0; word-break:break-word; }
