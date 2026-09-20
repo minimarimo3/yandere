@@ -1,0 +1,19 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+
+# macOS
+.DS_Store
+
+# Local secrets / runtime data
+.env
+.env.*
+config.toml
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# IDE
+.idea/
+.vscode/

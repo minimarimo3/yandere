@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Yandere Companion</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <div id="presence-label" class="eyebrow">MACの中にいる</div>
+      <h1 id="companion-name">美月</h1>
+    </div>
+    <div id="status-dot" class="status bad" title="screenpipe status"></div>
+  </header>
+
+  <nav>
+    <button class="tab active" data-tab="chat">会話</button>
+    <button class="tab" data-tab="diary">日記</button>
+    <button class="tab" data-tab="settings">設定</button>
+  </nav>
+
+  <main>
+    <section id="chat" class="panel active">
+      <div id="observation" class="observation">まだ観察を始めていません。</div>
+      <div id="messages" class="messages"></div>
+      <form id="chat-form" class="composer">
+        <textarea id="chat-input" rows="2" placeholder="話しかける…"></textarea>
+        <button type="submit" id="send">送る</button>
+      </form>
+    </section>
+
+    <section id="diary" class="panel">
+      <div class="section-head">
+        <strong>今日の日記</strong>
+        <button id="make-diary" class="secondary">今つくる</button>
+      </div>
+      <article id="diary-text" class="diary-text">まだ今日の日記はありません。</article>
+    </section>
+
+    <section id="settings" class="panel settings">
+      <label>名前<input id="cfg-companion-name" /></label>
+      <label>あなたの呼び名<input id="cfg-user-name" /></label>
+      <label>screenpipe Local API Key<input id="cfg-screenpipe-key" type="password" autocomplete="off" placeholder="sp-…" /></label>
+      <label>Groq API Key<input id="cfg-groq-key" type="password" autocomplete="off" /></label>
+      <label>Gemini API Key<input id="cfg-gemini-key" type="password" autocomplete="off" /></label>
+      <div class="two-col">
+        <label>観察間隔（秒）<input id="cfg-interval" type="number" min="30" /></label>
+        <label>通知の最短間隔（分）<input id="cfg-gap" type="number" min="1" /></label>
+      </div>
+      <label>人格<textarea id="cfg-persona" rows="11"></textarea></label>
+      <div class="actions">
+        <button id="observe-now" class="secondary">今すぐ観察</button>
+        <button id="save-settings">保存</button>
+      </div>
+      <p class="tiny">screenpipeキーは <code>npx -y screenpipe@latest auth token</code> で確認できます。APIキーはこのMacのアプリデータ内の config.toml に保存されます。</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

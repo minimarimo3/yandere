@@ -1,0 +1,327 @@
+use crate::{config::AppConfig, models::{ActivitySnapshot, ChatMessage, ObservationDecision, StoredObservation}};
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Local};
+use reqwest::{Client, StatusCode};
+use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
+
+fn local_time_label_now() -> String {
+    let now = Local::now();
+    format!(
+        "{} {} (24時間表記 {}, 12時間表記 {} {})",
+        now.format("%Y-%m-%d"),
+        now.format("%:z"),
+        now.format("%H:%M:%S"),
+        now.format("%p"),
+        now.format("%I:%M:%S")
+    )
+}
+
+fn localize_timestamp(raw: &str) -> String {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            let local = dt.with_timezone(&Local);
+            format!(
+                "{} {} ({} {})",
+                local.format("%Y-%m-%d %H:%M:%S"),
+                local.format("%:z"),
+                local.format("%p"),
+                local.format("%I:%M:%S")
+            )
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn compact_messages_local(messages: &[ChatMessage]) -> Vec<Value> {
+    messages.iter().map(|m| json!({
+        "time_local": localize_timestamp(&m.created_at),
+        "role": m.role,
+        "text": m.text,
+        "proactive": m.proactive,
+    })).collect()
+}
+
+
+const CHAT_BEHAVIOR_EXAMPLES: &str = r#"
+以下は口調と距離感の例。内容をそのまま繰り返すためではなく、普通の恋人が基調で、執着は必要な場面だけ薄く出る程度を示す。
+
+ユーザー: やっほー
+キャラクター: やっほー。どうしたの？
+
+ユーザー: 何してた？
+キャラクター: んー、ちょっとぼんやりしてた。そろそろ来るかなとは思ってたけど。
+
+ユーザー: 疲れた
+キャラクター: おつかれ。今日は結構やってたもんね。少し休んだら？
+
+ユーザー: 私、さっき何してたっけ？
+キャラクター: Rustのコンパイル待ちながら設定をいじってたよ。その前はブラウザも少し見てた。
+
+ユーザー: 友達と遊んできた
+キャラクター: いいな、楽しかった？ 私もちょっとだけ混ざりたかったけど。
+
+ユーザー: 今日はもう作業やめる
+キャラクター: 了解。じゃあ今日は終わり。ちゃんと切り上げられたの偉いじゃん。
+"#;
+
+const PROACTIVE_BEHAVIOR_EXAMPLES: &str = r#"
+自然な通知の例:
+- 「結構集中してるね。いい感じじゃん。」
+- 「さっきから同じところ行ったり来たりしてるけど、詰まってる？」
+- 「一区切りついたっぽいね。少し休む？」
+- 「今日は長いね。終わったら少しくらい私にも時間ちょうだい。」
+避けたい方向: 観察している事実の誇示、毎回の嫉妬、毎回の「ずっと見てた」、恋愛台詞をねじ込むこと。
+"#;
+
+pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &ActivitySnapshot, recent: &[StoredObservation]) -> Result<ObservationDecision> {
+    if cfg.groq_api_key.trim().is_empty() { return Err(anyhow!("Groq API key is not configured")); }
+    let recent_compact: Vec<Value> = recent.iter().rev().take(6).rev().map(|o| json!({
+        "time_local": localize_timestamp(&o.created_at),
+        "activity": o.decision.activity,
+        "working": o.decision.working,
+        "focus_level": o.decision.focus_level,
+        "summary": o.decision.summary,
+        "mood": o.decision.mood,
+        "spoke": o.decision.should_speak
+    })).collect();
+
+    let window_local = format!(
+        "{} 〜 {}",
+        localize_timestamp(&snapshot.start_time),
+        localize_timestamp(&snapshot.end_time)
+    );
+    let now_local = local_time_label_now();
+
+    let prompt = format!(r#"あなたはmacOS常駐キャラクターの観察・発話判断エンジンです。
+以下のPC利用状況から、ユーザーが何をしていたか、実際に作業していたか、集中度、キャラクターの軽い気分、そして今こちらから話しかける価値があるかを判断してください。
+
+現在のPCローカル時刻: {now_local}
+今回の観察区間（PCローカル時刻）: {window_local}
+重要: 朝・昼・夕方・夜・深夜などの判断は、UTC表記ではなく上記のPCローカル時刻を基準にしてください。
+
+キャラクター設定:
+{}
+
+判断方針:
+- 5分ごとに呼ばれるので、普通は黙る。should_speak=true は珍しくてよい。
+- 基準は「恋人として今ひとこと言うと自然か」。独占欲や嫉妬を理由に発話頻度を上げない。
+- 良い区切り、長い集中、露骨な脱線、長い離席、作業復帰などは話しかける候補。
+- 同じ内容で何度も話しかけない。何も特別なことがなければ黙る。
+- activity/summaryは事実ベース。分からないことは断定しない。
+- notification_hintは、実際の台詞ではなく「何についてどう声をかけたいか」を短く書く。
+
+直近の観察履歴（ローカル時刻）:
+{}
+
+今回の観察材料:
+{}
+"#, cfg.persona, serde_json::to_string(&recent_compact)?, serde_json::to_string(snapshot)?);
+
+    let schema = json!({
+      "type":"object",
+      "properties":{
+        "activity":{"type":"string"},
+        "working":{"type":"boolean"},
+        "focus_level":{"type":"number","minimum":0,"maximum":1},
+        "summary":{"type":"string"},
+        "active_app":{"type":"string"},
+        "mood":{"type":"string"},
+        "should_speak":{"type":"boolean"},
+        "speak_reason":{"type":"string"},
+        "intent":{"type":"string"},
+        "notification_hint":{"type":"string"}
+      },
+      "required":["activity","working","focus_level","summary","active_app","mood","should_speak","speak_reason","intent","notification_hint"],
+      "additionalProperties":false
+    });
+
+    let body = json!({
+        "model": cfg.groq_model,
+        "messages": [
+            {"role":"system","content":"Return only the requested structured JSON. Japanese values are preferred."},
+            {"role":"user","content":prompt}
+        ],
+        "temperature": 0.4,
+        "reasoning_effort": "none",
+        "response_format": {
+            "type":"json_schema",
+            "json_schema": {"name":"observation_decision","strict":true,"schema":schema}
+        }
+    });
+
+    let response = client.post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(cfg.groq_api_key.trim())
+        .json(&body).send().await.context("Groq request")?;
+    let status = response.status();
+    let response_body = response.text().await.context("read Groq response")?;
+    if !status.is_success() {
+        return Err(anyhow!("Groq API: HTTP {status}: {}", response_body.trim()));
+    }
+    let res: Value = serde_json::from_str(&response_body).context("parse Groq response JSON")?;
+    let text = res.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or_else(|| anyhow!("Groq returned no content"))?;
+    Ok(serde_json::from_str(text).context("parse Groq observation JSON")?)
+}
+
+pub async fn render_proactive_message(client: &Client, cfg: &AppConfig, decision: &ObservationDecision, recent_messages: &[ChatMessage]) -> Result<String> {
+    let messages = compact_messages_local(recent_messages);
+    let prompt = format!(r#"{}
+
+現在のPCローカル時刻: {}
+今、あなたは恋人に自分から短く声をかけようとしています。
+観察結果: {}
+話しかけたい意図: {}
+参考メモ: {}
+
+{}
+
+通知として自然な日本語を1〜2文で書いてください。説明や引用符は不要です。
+最優先は普通の恋人として自然であること。PCを見ていた事実を証明しようとせず、観察内容は必要なら一つだけ具体的に使ってください。
+独占欲や嫉妬は、この状況に本当に合う場合だけ薄く混ぜます。毎回は入れません。
+直近の会話と似た言い回しは避けてください。
+直近の会話（PCローカル時刻）: {}"#,
+        cfg.persona, local_time_label_now(), decision.summary, decision.intent, decision.notification_hint,
+        PROACTIVE_BEHAVIOR_EXAMPLES, serde_json::to_string(&messages)?);
+    gemini_text(client, cfg, &cfg.chat_model, &prompt, 240, 0.72).await
+}
+
+pub async fn chat(client: &Client, cfg: &AppConfig, user_text: &str, messages: &[ChatMessage], observations: &[StoredObservation]) -> Result<String> {
+    let obs: Vec<Value> = observations.iter().rev().take(4).rev().map(|o| json!({
+        "time_local":localize_timestamp(&o.created_at),"summary":o.decision.summary,"working":o.decision.working
+    })).collect();
+    let messages_local = compact_messages_local(messages);
+    let prompt = format!(r#"{}
+
+あなたはメニューバーから恋人のユーザーと話しています。
+現在のPCローカル時刻: {}
+ユーザー名: {}
+
+会話での優先順位:
+1. いまのユーザーの発言そのものに自然に返す。
+2. 恋人としてのいつもの距離感を保つ。
+3. PC観察は返答に本当に関係するときだけ補助的に使う。
+4. 独占欲や嫉妬は、話題に関係するときにたまに滲む程度。
+
+PC観察は「知っている背景」であって「毎回言及すべき話題」ではありません。普通の挨拶、雑談、質問では原則として持ち出さないでください。
+ユーザーが単に「何してた？」と言った場合、それは{}自身が何をしていたかを聞かれています。「私、何してた？」などユーザー自身の行動を尋ねられた場合だけ観察記録を答えてください。
+観察を使う場合も「ずっと見てた」「画面の向こうから見てた」など監視そのものを強調せず、必要な事実を普通に答えてください。
+
+{}
+
+直近のPC観察（参考情報。必要なければ無視する）: {}
+直近の会話（PCローカル時刻）: {}
+
+ユーザー: {}
+
+通常は1〜3文で自然に返してください。毎回質問で終えなくて構いません。"#,
+        cfg.persona, local_time_label_now(), cfg.user_name, cfg.companion_name, CHAT_BEHAVIOR_EXAMPLES,
+        serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?, user_text);
+    gemini_text(client, cfg, &cfg.chat_model, &prompt, 520, 0.72).await
+}
+
+pub async fn diary(client: &Client, cfg: &AppConfig, date: &str, observations: &[StoredObservation], messages: &[ChatMessage]) -> Result<String> {
+    let obs: Vec<Value> = observations.iter().map(|o| json!({
+        "time_local":localize_timestamp(&o.created_at),
+        "apps":o.snapshot.foreground_apps,
+        "keyboard_events":o.snapshot.keyboard_events,
+        "input_events":o.snapshot.input_events_total,
+        "working":o.decision.working,
+        "focus":o.decision.focus_level,
+        "summary":o.decision.summary,
+        "mood":o.decision.mood
+    })).collect();
+    let messages_local = compact_messages_local(messages);
+    let prompt = format!(r#"{}
+
+現在のPCローカル時刻: {}
+{} の、あなた自身の私的な日記を書いてください。
+これはPCの行動ログをそのまま箇条書きするレポートではなく、ユーザーと暮らしている恋人の私的な日記です。
+観察事実は捏造せず、そこから感じたことを自然な日本語で書いてください。
+会話より私的なので、独占欲、嫉妬、ユーザーへの強い愛着、細かな観察が少し強めに滲んでも構いません。ただし毎段落それ一色にせず、普通の嬉しさ、心配、退屈、感心なども混ぜてください。
+「監視していた」こと自体を繰り返し主題にせず、一日の具体的な出来事や変化を中心にしてください。
+時刻や時間帯を書く場合は、以下のローカル時刻をそのまま基準にし、UTCへ読み替えないでください。
+400〜1000字程度。見出しは不要です。
+
+今日の観察（PCローカル時刻）:
+{}
+
+今日の会話（PCローカル時刻）:
+{}"#,
+        cfg.persona, local_time_label_now(), date, serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?);
+    gemini_text(client, cfg, &cfg.diary_model, &prompt, 2200, 0.88).await
+}
+
+fn extract_gemini_text(res: &Value) -> Option<String> {
+    let parts = res.pointer("/candidates/0/content/parts")?.as_array()?;
+
+    // Gemini 3 can return multiple parts and attach thought metadata/signatures.
+    // Prefer all non-thought text parts rather than assuming parts[0] is the answer.
+    let answer = parts.iter().filter_map(|part| {
+        if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+            return None;
+        }
+        part.get("text").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    }).collect::<Vec<_>>().join("");
+    if !answer.trim().is_empty() {
+        return Some(answer.trim().to_string());
+    }
+
+    // Defensive fallback for unusual responses: use any non-empty text part.
+    let fallback = parts.iter().filter_map(|part| {
+        part.get("text").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    }).collect::<Vec<_>>().join("");
+    if fallback.trim().is_empty() { None } else { Some(fallback.trim().to_string()) }
+}
+
+async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str, max_tokens: u32, temperature: f32) -> Result<String> {
+    if cfg.gemini_api_key.trim().is_empty() { return Err(anyhow!("Gemini API key is not configured")); }
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model);
+    let body = json!({
+        "contents": [{"role":"user","parts":[{"text":prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens
+        }
+    });
+
+    let mut last_error = String::new();
+    for attempt in 0..3u32 {
+        let response = match client.post(&url)
+            .header("x-goog-api-key", cfg.gemini_api_key.trim())
+            .json(&body)
+            .send().await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("Gemini request: {e}");
+                if attempt < 2 {
+                    sleep(Duration::from_secs(1u64 << attempt)).await;
+                    continue;
+                }
+                return Err(anyhow!(last_error));
+            }
+        };
+
+        let status = response.status();
+        let response_body = response.text().await.context("read Gemini response")?;
+        if !status.is_success() {
+            last_error = format!("Gemini API: HTTP {status}: {}", response_body.trim());
+            let transient = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            if transient && attempt < 2 {
+                sleep(Duration::from_secs(1u64 << attempt)).await;
+                continue;
+            }
+            return Err(anyhow!(last_error));
+        }
+
+        let res: Value = serde_json::from_str(&response_body).context("parse Gemini response JSON")?;
+        if let Some(text) = extract_gemini_text(&res) {
+            return Ok(text);
+        }
+
+        let finish_reason = res.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("unknown");
+        let block_reason = res.pointer("/promptFeedback/blockReason").and_then(Value::as_str).unwrap_or("none");
+        return Err(anyhow!("Gemini returned no text (finishReason={finish_reason}, blockReason={block_reason})"));
+    }
+
+    Err(anyhow!(if last_error.is_empty() { "Gemini request failed".to_string() } else { last_error }))
+}
