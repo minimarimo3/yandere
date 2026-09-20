@@ -1,4 +1,4 @@
-use crate::{config::AppConfig, models::{ActivitySnapshot, ChatMessage, ObservationDecision, StoredObservation}};
+use crate::{config::AppConfig, logging, models::{ActivitySnapshot, ChatMessage, ObservationDecision, StoredObservation}};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
 use reqwest::{Client, StatusCode};
@@ -73,8 +73,89 @@ const PROACTIVE_BEHAVIOR_EXAMPLES: &str = r#"
 避けたい方向: 観察している事実の誇示、毎回の嫉妬、毎回の「ずっと見てた」、恋愛台詞をねじ込むこと。
 "#;
 
+fn parse_observation_decision(text: &str) -> Result<ObservationDecision> {
+    let mut cleaned = text.trim();
+    if let Some(rest) = cleaned.strip_prefix("```json") {
+        cleaned = rest.trim();
+    } else if let Some(rest) = cleaned.strip_prefix("```") {
+        cleaned = rest.trim();
+    }
+    if let Some(rest) = cleaned.strip_suffix("```") {
+        cleaned = rest.trim();
+    }
+
+    if let Ok(value) = serde_json::from_str::<ObservationDecision>(cleaned) {
+        return Ok(value);
+    }
+
+    // Gemma can occasionally add a tiny preface/suffix even when explicitly
+    // asked for JSON. Salvage exactly the outer JSON object, but never guess
+    // missing fields: serde still validates the complete ObservationDecision.
+    if let (Some(first), Some(last)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        if first < last {
+            return serde_json::from_str::<ObservationDecision>(&cleaned[first..=last])
+                .context("parse observation JSON object");
+        }
+    }
+    Err(anyhow!("observation model returned invalid JSON"))
+}
+
+async fn observe_with_google_model(
+    client: &Client,
+    cfg: &AppConfig,
+    model: &str,
+    prompt: &str,
+    schema: &Value,
+) -> Result<ObservationDecision> {
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model);
+
+    // Gemma 4 is deliberately left in ordinary text mode. It is strongly
+    // instructed to emit one JSON object and we validate it locally. This
+    // keeps the primary path compatible even if model-specific structured
+    // output support changes. The final Gemini fallback uses server-enforced
+    // JSON Schema for maximum reliability.
+    let mut generation_config = json!({
+        "temperature": 0.35,
+        "maxOutputTokens": 420
+    });
+    if model.starts_with("gemma-4") {
+        generation_config["thinkingConfig"] = json!({"thinkingLevel":"minimal"});
+    } else {
+        generation_config["responseMimeType"] = json!("application/json");
+        generation_config["responseJsonSchema"] = schema.clone();
+    }
+
+    let body = json!({
+        "systemInstruction": {
+            "parts": [{"text":"Return exactly one valid JSON object and nothing else. Do not use Markdown fences. Japanese string values are preferred."}]
+        },
+        "contents": [{"role":"user","parts":[{"text":prompt}]}],
+        "generationConfig": generation_config
+    });
+
+    let response = client.post(&url)
+        .header("x-goog-api-key", cfg.gemini_api_key.trim())
+        .json(&body)
+        .send().await
+        .with_context(|| format!("observation request to {model}"))?;
+
+    let status = response.status();
+    let response_body = response.text().await.context("read observation response")?;
+    if !status.is_success() {
+        return Err(anyhow!("Google AI {model}: HTTP {status}: {}", response_body.trim()));
+    }
+
+    let res: Value = serde_json::from_str(&response_body)
+        .with_context(|| format!("parse {model} response envelope"))?;
+    let text = extract_gemini_text(&res).ok_or_else(|| {
+        let finish_reason = res.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("unknown");
+        anyhow!("Google AI {model} returned no text (finishReason={finish_reason})")
+    })?;
+    parse_observation_decision(&text).with_context(|| format!("validate observation from {model}"))
+}
+
 pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &ActivitySnapshot, recent: &[StoredObservation]) -> Result<ObservationDecision> {
-    if cfg.groq_api_key.trim().is_empty() { return Err(anyhow!("Groq API key is not configured")); }
+    if cfg.gemini_api_key.trim().is_empty() { return Err(anyhow!("Gemini API key is not configured")); }
     let recent_compact: Vec<Value> = recent.iter().rev().take(6).rev().map(|o| json!({
         "time_local": localize_timestamp(&o.created_at),
         "activity": o.decision.activity,
@@ -103,12 +184,13 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
 {}
 
 判断方針:
-- 5分ごとに呼ばれるので、普通は黙る。should_speak=true は珍しくてよい。
+- 定期的に何度も呼ばれるので、普通は黙る。should_speak=true は珍しくてよい。
 - 基準は「恋人として今ひとこと言うと自然か」。独占欲や嫉妬を理由に発話頻度を上げない。
 - 良い区切り、長い集中、露骨な脱線、長い離席、作業復帰などは話しかける候補。
 - 同じ内容で何度も話しかけない。何も特別なことがなければ黙る。
 - activity/summaryは事実ベース。分からないことは断定しない。
 - notification_hintは、実際の台詞ではなく「何についてどう声をかけたいか」を短く書く。
+- 次のキーをすべて含むJSONオブジェクトだけを返す: activity, working, focus_level, summary, active_app, mood, should_speak, speak_reason, intent, notification_hint。
 
 直近の観察履歴（ローカル時刻）:
 {}
@@ -135,31 +217,33 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
       "additionalProperties":false
     });
 
-    let body = json!({
-        "model": cfg.groq_model,
-        "messages": [
-            {"role":"system","content":"Return only the requested structured JSON. Japanese values are preferred."},
-            {"role":"user","content":prompt}
-        ],
-        "temperature": 0.4,
-        "reasoning_effort": "none",
-        "response_format": {
-            "type":"json_schema",
-            "json_schema": {"name":"observation_decision","strict":true,"schema":schema}
+    let models = [
+        cfg.observer_primary_model.as_str(),
+        cfg.observer_fallback_model.as_str(),
+        cfg.observer_last_fallback_model.as_str(),
+    ];
+    let mut errors = Vec::new();
+    for (index, model) in models.iter().enumerate() {
+        match observe_with_google_model(client, cfg, model, &prompt, &schema).await {
+            Ok(decision) => {
+                if index > 0 {
+                    logging::info(&format!("observation fallback succeeded with {model}"));
+                }
+                return Ok(decision);
+            }
+            Err(e) => {
+                let message = format!("observation model {model} failed: {e:#}");
+                errors.push(message.clone());
+                if index + 1 < models.len() {
+                    logging::warn(&format!("{message}; falling back to {}", models[index + 1]));
+                } else {
+                    logging::error(&message);
+                }
+            }
         }
-    });
-
-    let response = client.post("https://api.groq.com/openai/v1/chat/completions")
-        .bearer_auth(cfg.groq_api_key.trim())
-        .json(&body).send().await.context("Groq request")?;
-    let status = response.status();
-    let response_body = response.text().await.context("read Groq response")?;
-    if !status.is_success() {
-        return Err(anyhow!("Groq API: HTTP {status}: {}", response_body.trim()));
     }
-    let res: Value = serde_json::from_str(&response_body).context("parse Groq response JSON")?;
-    let text = res.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or_else(|| anyhow!("Groq returned no content"))?;
-    Ok(serde_json::from_str(text).context("parse Groq observation JSON")?)
+
+    Err(anyhow!("all observation models failed: {}", errors.join(" | ")))
 }
 
 pub async fn render_proactive_message(client: &Client, cfg: &AppConfig, decision: &ObservationDecision, recent_messages: &[ChatMessage]) -> Result<String> {
@@ -294,9 +378,11 @@ async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str
             Err(e) => {
                 last_error = format!("Gemini request: {e}");
                 if attempt < 2 {
+                    logging::warn(&format!("{last_error}; retry {}/3", attempt + 1));
                     sleep(Duration::from_secs(1u64 << attempt)).await;
                     continue;
                 }
+                logging::error(&last_error);
                 return Err(anyhow!(last_error));
             }
         };
@@ -307,9 +393,11 @@ async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str
             last_error = format!("Gemini API: HTTP {status}: {}", response_body.trim());
             let transient = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
             if transient && attempt < 2 {
+                logging::warn(&format!("{last_error}; retry {}/3", attempt + 1));
                 sleep(Duration::from_secs(1u64 << attempt)).await;
                 continue;
             }
+            logging::error(&last_error);
             return Err(anyhow!(last_error));
         }
 
@@ -320,7 +408,9 @@ async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str
 
         let finish_reason = res.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("unknown");
         let block_reason = res.pointer("/promptFeedback/blockReason").and_then(Value::as_str).unwrap_or("none");
-        return Err(anyhow!("Gemini returned no text (finishReason={finish_reason}, blockReason={block_reason})"));
+        let message = format!("Gemini returned no text (finishReason={finish_reason}, blockReason={block_reason})");
+        logging::error(&message);
+        return Err(anyhow!(message));
     }
 
     Err(anyhow!(if last_error.is_empty() { "Gemini request failed".to_string() } else { last_error }))

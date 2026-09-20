@@ -1,9 +1,11 @@
-use crate::models::{ActivitySnapshot, AppActivity};
+use crate::{logging, models::{ActivitySnapshot, AppActivity}};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde_json::Value;
 use std::{collections::{HashMap, HashSet}, fs::OpenOptions, path::Path, process::{Command, Stdio}};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use tokio::time::{sleep, Duration};
 
 fn authed(req: RequestBuilder, api_key: &str) -> RequestBuilder {
@@ -51,6 +53,7 @@ async fn json_response(req: RequestBuilder, label: &str) -> Result<Value> {
         let transient = status == StatusCode::SERVICE_UNAVAILABLE
             || status == StatusCode::TOO_MANY_REQUESTS;
         if transient && attempt < 3 {
+            logging::warn(&format!("{label}: HTTP {status} from {url}; retry {}/4", attempt + 1));
             let body_delay = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| v.get("retry_after_ms").and_then(Value::as_u64));
@@ -67,7 +70,9 @@ async fn json_response(req: RequestBuilder, label: &str) -> Result<Value> {
         } else {
             body.trim()
         };
-        return Err(anyhow!("{label}: HTTP {status} for {url}: {detail}"));
+        let message = format!("{label}: HTTP {status} for {url}: {detail}");
+        logging::error(&message);
+        return Err(anyhow!(message));
     }
 
     Err(anyhow!("{label}: retries exhausted"))
@@ -89,6 +94,7 @@ fn local_screenpipe_url(base: &str) -> bool {
 /// binary is preferred; `npx screenpipe@latest` is the fallback.
 pub async fn ensure_daemon(client: &Client, base: &str, data_dir: &Path) -> Result<()> {
     if health(client, base).await { return Ok(()); }
+    logging::info(&format!("screenpipe is not running at {base}; starting recorder"));
     if !local_screenpipe_url(base) {
         return Err(anyhow!("screenpipe is not reachable at configured non-local URL: {base}"));
     }
@@ -104,21 +110,172 @@ pub async fn ensure_daemon(client: &Client, base: &str, data_dir: &Path) -> Resu
         "if command -v screenpipe >/dev/null 2>&1; then exec screenpipe {args}; else exec npx -y screenpipe@latest {args}; fi"
     );
 
-    Command::new("/bin/zsh")
+    let mut command = Command::new("/bin/zsh");
+    command
         .arg("-lc")
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("start screenpipe")?;
+        .stderr(Stdio::from(stderr));
+
+    // Put the complete npx/node/native screenpipe chain in its own process
+    // group.  Killing only the final TCP listener leaves the npm/node parents
+    // alive, which in turn can keep macOS' screen-recording indicator around.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command.spawn().context("start screenpipe")?;
+    let launcher_pid = child.id();
+    std::fs::write(data_dir.join("screenpipe.pid"), launcher_pid.to_string())
+        .context("write screenpipe launcher pid")?;
+    logging::info(&format!("started screenpipe process group pgid={launcher_pid}"));
 
     // `npx` may need a moment to resolve the package after login.
     for _ in 0..45 {
         sleep(Duration::from_secs(1)).await;
-        if health(client, base).await { return Ok(()); }
+        if health(client, base).await {
+            logging::info(&format!("screenpipe became healthy at {base}"));
+            return Ok(());
+        }
     }
-    Err(anyhow!("screenpipe did not become healthy after automatic start; see {}", log_path.display()))
+    let message = format!("screenpipe did not become healthy after automatic start; see {}", log_path.display());
+    logging::error(&message);
+    Err(anyhow!(message))
+}
+
+fn local_port(base: &str) -> Result<u16> {
+    if !local_screenpipe_url(base) {
+        return Err(anyhow!("refusing to stop non-local screenpipe URL: {base}"));
+    }
+    let url = Url::parse(base).with_context(|| format!("parse screenpipe URL {base}"))?;
+    url.port_or_known_default().ok_or_else(|| anyhow!("screenpipe URL has no port: {base}"))
+}
+
+/// Stop the local screenpipe recorder and its launcher chain.
+///
+/// When this app starts screenpipe through `npx`, the process tree is normally
+/// `npm exec -> node -> native screenpipe`.  The native child owns port 3030,
+/// but killing only that child is not enough: its npm/node parents survive.
+/// New launches are therefore placed in their own Unix process group and the
+/// group id is stored in `screenpipe.pid`.  Shutdown terminates that whole
+/// group.  A legacy fallback also walks upward from the TCP listener so an
+/// already-running recorder created by v0.1.11 or older is cleaned up too.
+pub async fn stop_daemon(_client: &Client, base: &str, data_dir: &Path) -> Result<()> {
+    let port = local_port(base)?;
+    logging::info(&format!("stopping screenpipe on TCP port {port}"));
+
+    let pid_path = data_dir.join("screenpipe.pid");
+    if let Ok(raw) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pgid) = raw.trim().parse::<i32>() {
+            // Validate the persisted pid before sending a signal.  A stale pid
+            // may eventually be reused by an unrelated process.
+            let command = Command::new("/bin/ps")
+                .args(["-p", &pgid.to_string(), "-o", "command="])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if command.to_ascii_lowercase().contains("screenpipe") {
+                logging::info(&format!("terminating tracked screenpipe process group pgid={pgid}"));
+                #[cfg(unix)]
+                unsafe {
+                    // Negative pid means process group.
+                    libc::kill(-pgid, libc::SIGTERM);
+                }
+                for _ in 0..10 {
+                    sleep(Duration::from_millis(100)).await;
+                    #[cfg(unix)]
+                    let alive = unsafe { libc::kill(-pgid, 0) == 0 };
+                    #[cfg(not(unix))]
+                    let alive = false;
+                    if !alive { break; }
+                }
+                #[cfg(unix)]
+                unsafe {
+                    if libc::kill(-pgid, 0) == 0 {
+                        logging::warn(&format!("screenpipe process group pgid={pgid} survived TERM; sending KILL"));
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            } else if !command.trim().is_empty() {
+                logging::warn(&format!("ignoring stale screenpipe.pid={pgid}; process is: {}", command.trim()));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&pid_path);
+
+    // Legacy cleanup for recorders started by older companion versions (or
+    // manually with npx). Start at each listener and walk through parent
+    // processes while their command line still belongs to `screenpipe record`.
+    // This catches npm exec + node + native screenpipe without killing an
+    // unrelated parent shell or the companion itself.
+    let script = format!(r#"
+        listeners=$(/usr/sbin/lsof -tiTCP:{port} -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')
+        targets=""
+        for listener in $listeners; do
+          current="$listener"
+          first=1
+          while [ -n "$current" ] && [ "$current" -gt 1 ] 2>/dev/null; do
+            cmd=$(/bin/ps -p "$current" -o command= 2>/dev/null || true)
+            if [ "$first" = 1 ]; then
+              targets="$targets $current"
+              first=0
+            else
+              case "$cmd" in
+                *screenpipe*record*) targets="$targets $current" ;;
+                *) break ;;
+              esac
+            fi
+            parent=$(/bin/ps -p "$current" -o ppid= 2>/dev/null | tr -d ' ')
+            [ -z "$parent" ] && break
+            current="$parent"
+          done
+        done
+
+        targets=$(printf '%s\n' $targets | /usr/bin/sort -u | tr '\n' ' ')
+        if [ -n "$targets" ]; then
+          /bin/kill -TERM $targets 2>/dev/null || true
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 0.1
+            alive=""
+            for pid in $targets; do
+              if /bin/kill -0 "$pid" 2>/dev/null; then alive="$alive $pid"; fi
+            done
+            [ -z "$alive" ] && break
+          done
+          for pid in $targets; do
+            if /bin/kill -0 "$pid" 2>/dev/null; then
+              /bin/kill -KILL "$pid" 2>/dev/null || true
+            fi
+          done
+        fi
+    "#);
+
+    let output = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::null())
+        .output()
+        .context("stop legacy screenpipe process tree")?;
+    if !output.status.success() {
+        logging::warn(&format!("legacy screenpipe cleanup exited with {}", output.status));
+    }
+
+    // Verify the actual recorder listener is gone before reporting success.
+    let remaining = Command::new("/usr/sbin/lsof")
+        .args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if remaining.is_empty() {
+        logging::info("screenpipe process tree stopped");
+        Ok(())
+    } else {
+        let message = format!("screenpipe listener still present after shutdown; pid(s): {remaining}");
+        logging::error(&message);
+        Err(anyhow!(message))
+    }
 }
 
 /// Checks both daemon health and authenticated API access. `/health` itself is

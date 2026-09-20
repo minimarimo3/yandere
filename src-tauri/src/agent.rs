@@ -1,7 +1,7 @@
-use crate::{config, db, llm, models::{ActivitySnapshot, DiaryEntry}, rhythm, screenpipe, AppState};
+use crate::{config, db, llm, logging, models::{ActivitySnapshot, DiaryEntry}, rhythm, screenpipe, AppState};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration, Instant};
@@ -15,10 +15,15 @@ pub async fn run_loop(app: AppHandle, state: Arc<AppState>) {
     let mut last_diary_attempt: Option<(String, Instant)> = None;
 
     loop {
+        if state.shutting_down.load(Ordering::SeqCst) {
+            logging::info("background loop stopped for application shutdown");
+            break;
+        }
+
         let cfg = match config::load(&state.data_dir) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("config: {e:#}");
+                logging::error(&format!("config: {e:#}"));
                 sleep(Duration::from_secs(60)).await;
                 continue;
             }
@@ -27,7 +32,7 @@ pub async fn run_loop(app: AppHandle, state: Arc<AppState>) {
         let rhythm_status = match rhythm::status(&state.data_dir) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("rhythm: {e:#}");
+                logging::error(&format!("rhythm: {e:#}"));
                 sleep(Duration::from_secs(SCHEDULER_TICK_SECONDS)).await;
                 continue;
             }
@@ -62,14 +67,14 @@ pub async fn run_loop(app: AppHandle, state: Arc<AppState>) {
             if reached {
                 last_diary_attempt = Some((date.clone(), Instant::now()));
                 if let Err(e) = maybe_make_diary(&app, &state, &cfg).await {
-                    eprintln!("diary: {e:#}");
+                    logging::error(&format!("diary: {e:#}"));
                 }
             }
         }
 
         if Instant::now() >= next_observation {
             if let Err(e) = observe_once(&app, &state, &cfg).await {
-                eprintln!("observe: {e:#}");
+                logging::error(&format!("observe: {e:#}"));
             }
             next_observation = Instant::now()
                 + Duration::from_secs(cfg.observation_interval_seconds.max(30));
@@ -90,7 +95,7 @@ pub async fn observe_once(app: &AppHandle, state: &Arc<AppState>, cfg: &config::
     // also makes login-start useful without requiring a separate terminal.
     screenpipe::ensure_daemon(&state.http, &cfg.screenpipe_url, &state.data_dir).await?;
 
-    if cfg.groq_api_key.trim().is_empty() { return Ok(()); }
+    if cfg.gemini_api_key.trim().is_empty() { return Ok(()); }
     let end = Utc::now();
     let start = end - ChronoDuration::minutes(cfg.observation_window_minutes.max(1));
     let snapshot = screenpipe::collect(&state.http, &cfg.screenpipe_url, &cfg.screenpipe_api_key, start, end).await?;

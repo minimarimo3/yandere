@@ -8,9 +8,10 @@ pub struct AppConfig {
     pub companion_name: String,
     pub user_name: String,
     pub persona: String,
-    pub groq_api_key: String,
     pub gemini_api_key: String,
-    pub groq_model: String,
+    pub observer_primary_model: String,
+    pub observer_fallback_model: String,
+    pub observer_last_fallback_model: String,
     pub chat_model: String,
     pub diary_model: String,
     pub screenpipe_url: String,
@@ -29,9 +30,10 @@ impl Default for AppConfig {
             companion_name: "美月".into(),
             user_name: "あなた".into(),
             persona: DEFAULT_PERSONA.into(),
-            groq_api_key: String::new(),
             gemini_api_key: String::new(),
-            groq_model: "qwen/qwen3.8-27b".into(),
+            observer_primary_model: "gemma-4-26b-a4b-it".into(),
+            observer_fallback_model: "gemma-4-31b-it".into(),
+            observer_last_fallback_model: "gemini-3.1-flash-lite".into(),
             chat_model: "gemini-3.5-flash-lite".into(),
             diary_model: "gemini-3.8-flash".into(),
             screenpipe_url: "http://127.0.0.1:3030".into(),
@@ -81,6 +83,12 @@ pub fn load(base: &Path) -> Result<AppConfig> {
     // Upgrade only the untouched built-in persona. User-customized personas are
     // never overwritten.
     let mut changed = false;
+    // v0.1.9 moved observation off Groq entirely. If an older config still
+    // contains Groq credentials/model settings, rewrite it once without those
+    // obsolete fields so the key is not kept around unnecessarily.
+    if raw.contains("groq_api_key") || raw.contains("groq_model") {
+        changed = true;
+    }
     if cfg.persona.trim() == OLD_DEFAULT_PERSONA.trim() {
         cfg.persona = DEFAULT_PERSONA.into();
         changed = true;

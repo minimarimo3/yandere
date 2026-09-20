@@ -43,10 +43,10 @@
       <label>名前<input id="cfg-companion-name" /></label>
       <label>あなたの呼び名<input id="cfg-user-name" /></label>
       <label>screenpipe Local API Key<input id="cfg-screenpipe-key" type="password" autocomplete="off" placeholder="sp-…" /></label>
-      <label>Groq API Key<input id="cfg-groq-key" type="password" autocomplete="off" /></label>
       <label>Gemini API Key<input id="cfg-gemini-key" type="password" autocomplete="off" /></label>
+      <p class="tiny model-chain">観察: Gemma 4 26B → Gemma 4 31B → Gemini 3.1 Flash Lite（自動fallback）</p>
       <div class="two-col">
-        <label>観察間隔（秒）<input id="cfg-interval" type="number" min="30" /></label>
+        <label>観察間隔（秒）<input id="cfg-interval" type="number" min="30" step="15" /></label>
         <label>通知の最短間隔（分）<input id="cfg-gap" type="number" min="1" /></label>
       </div>
       <label>人格<textarea id="cfg-persona" rows="11"></textarea></label>
@@ -54,7 +54,13 @@
         <button id="observe-now" class="secondary">今すぐ観察</button>
         <button id="save-settings">保存</button>
       </div>
-      <p class="tiny">screenpipeキーは <code>npx -y screenpipe@latest auth token</code> で確認できます。APIキーはこのMacのアプリデータ内の config.toml に保存されます。</p>
+      <div class="app-meta">
+        <div><span>バージョン</span><code id="app-version">-</code></div>
+        <div><span>アプリログ</span><code id="app-log-path">-</code></div>
+        <div><span>screenpipeログ</span><code id="screenpipe-log-path">-</code></div>
+      </div>
+      <button id="quit-all" class="danger">美月とscreenpipeを終了</button>
+      <p class="tiny">観察間隔は30〜180秒程度がおすすめです。screenpipeキーは <code>npx -y screenpipe@latest auth token</code> で確認できます。Gemini APIキーは観察・会話・日記で共通です。APIキーはこのMacのアプリデータ内の config.toml に保存されます。</p>
     </section>
   </main>
 

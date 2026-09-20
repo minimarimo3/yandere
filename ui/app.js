@@ -19,7 +19,6 @@ function fillConfig(c) {
   $('cfg-companion-name').value = c.companion_name;
   $('cfg-user-name').value = c.user_name;
   $('cfg-screenpipe-key').value = c.screenpipe_api_key || '';
-  $('cfg-groq-key').value = c.groq_api_key;
   $('cfg-gemini-key').value = c.gemini_api_key;
   $('cfg-interval').value = c.observation_interval_seconds;
   $('cfg-gap').value = c.minimum_notification_gap_minutes;
@@ -32,14 +31,35 @@ function renderBootstrap(d) {
 
   if (sleeping) {
     $('status-dot').className = 'status sleeping';
-    $('status-dot').title = `${d.config.companion_name}は睡眠中。起床予定 ${d.rhythm.wake_at_display}`;
-    $('observation').textContent = `すやすや寝ています。`;
+    $('status-dot').title = `${d.config.companion_name}は睡眠中`;
+    $('observation').textContent = 'すやすや寝ています。';
   } else {
     $('status-dot').className = `status ${d.screenpipe_ok ? 'good' : 'bad'}`;
     $('status-dot').title = d.screenpipe_ok ? 'screenpipe daemon 稼働中' : 'screenpipe daemon に接続できません';
     if (d.last_observation) {
       const o = d.last_observation.decision;
-      $('observation').textContent = `${o.working ? '作業中' : '作業外'} · ${Math.round(o.focus_level * 100)}% — ${o.summary}`;
+      const date = new Date(d.last_observation.created_at);
+      const now = new Date();
+
+      const sameDay =
+        date.getFullYear() === now.getFullYear() &&
+        date.getMonth() === now.getMonth() &&
+        date.getDate() === now.getDate();
+
+      const observedAt = sameDay
+        ? date.toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit'
+        })
+        : date.toLocaleString([], {
+          month: 'numeric',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+
+      $('observation').textContent =
+        `${observedAt} · ${o.working ? '作業中' : '作業外'} · ${Math.round(o.focus_level * 100)}% — ${o.summary}`;
     } else {
       $('observation').textContent = 'まだ観察を始めていません。';
     }
@@ -52,6 +72,9 @@ function renderBootstrap(d) {
   $('chat-input').placeholder = sleeping ? `${d.config.companion_name}は寝ています…` : '話しかける…';
 
   if (d.today_diary) $('diary-text').textContent = d.today_diary.text;
+  $('app-version').textContent = d.app_version || '-';
+  $('app-log-path').textContent = d.log_path || '-';
+  $('screenpipe-log-path').textContent = d.screenpipe_log_path || '-';
 }
 async function reload() { renderBootstrap(await invoke('bootstrap')); }
 
@@ -74,7 +97,6 @@ $('save-settings').addEventListener('click', async () => {
     companion_name:$('cfg-companion-name').value.trim() || '美月',
     user_name:$('cfg-user-name').value.trim() || 'あなた',
     screenpipe_api_key:$('cfg-screenpipe-key').value.trim(),
-    groq_api_key:$('cfg-groq-key').value.trim(),
     gemini_api_key:$('cfg-gemini-key').value.trim(),
     observation_interval_seconds:Number($('cfg-interval').value) || 300,
     minimum_notification_gap_minutes:Number($('cfg-gap').value) || 20,
@@ -96,6 +118,42 @@ $('observe-now').addEventListener('click', async () => {
   try { await invoke('observe_now'); await reload(); toast('観察しました'); }
   catch(e) { toast(`観察エラー: ${e}`); }
   finally { b.disabled=Boolean(data?.rhythm?.sleeping); }
+});
+
+
+let quitArmedUntil = 0;
+let quitResetTimer = null;
+
+$('quit-all').addEventListener('click', async () => {
+  const b = $('quit-all');
+  const now = Date.now();
+
+  // Native confirm()/alert() dialogs are unreliable from a non-activating
+  // NSPanel (especially while another app owns the fullscreen Space).
+  // Use an inline two-step confirmation instead.
+  if (now > quitArmedUntil) {
+    quitArmedUntil = now + 5000;
+    b.textContent = 'もう一度押すと終了';
+    toast('5秒以内にもう一度押すと、美月とscreenpipeを終了します');
+    if (quitResetTimer) clearTimeout(quitResetTimer);
+    quitResetTimer = setTimeout(() => {
+      quitArmedUntil = 0;
+      b.textContent = '美月とscreenpipeを終了';
+    }, 5000);
+    return;
+  }
+
+  quitArmedUntil = 0;
+  if (quitResetTimer) clearTimeout(quitResetTimer);
+  b.disabled = true;
+  b.textContent = '終了しています…';
+  try {
+    await invoke('quit_all');
+  } catch(e) {
+    b.disabled = false;
+    b.textContent = '美月とscreenpipeを終了';
+    toast(`終了エラー: ${e}`);
+  }
 });
 
 listen('new_message', async () => { await reload(); });

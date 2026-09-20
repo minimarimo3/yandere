@@ -80,8 +80,10 @@ pub struct DiaryEntry {
 pub struct RhythmStatus {
     pub sleeping: bool,
     pub sleep_at_local: String,
+    #[serde(skip_serializing)]
     pub wake_at_local: String,
     pub sleep_at_display: String,
+    #[serde(skip_serializing)]
     pub wake_at_display: String,
 }
 
@@ -93,4 +95,7 @@ pub struct BootstrapData {
     pub today_diary: Option<DiaryEntry>,
     pub screenpipe_ok: bool,
     pub rhythm: RhythmStatus,
+    pub app_version: String,
+    pub log_path: String,
+    pub screenpipe_log_path: String,
 }
