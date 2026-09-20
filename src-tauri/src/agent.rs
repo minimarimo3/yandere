@@ -1,13 +1,26 @@
 use crate::{config, db, llm, logging, models::{ActivitySnapshot, DiaryEntry}, rhythm, screenpipe, AppState};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
-use std::sync::{Arc, atomic::Ordering};
+use std::{sync::{Arc, atomic::Ordering}, time::{SystemTime, UNIX_EPOCH}};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration, Instant};
 
 const SCHEDULER_TICK_SECONDS: u64 = 15;
 const DIARY_RETRY_GAP_SECONDS: u64 = 5 * 60;
+
+fn next_observation_delay(cfg: &config::AppConfig) -> Duration {
+    let min = cfg.observation_interval_min_seconds.max(60);
+    let max = cfg.observation_interval_max_seconds.max(min);
+    if min == max {
+        return Duration::from_secs(min);
+    }
+    let entropy = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(min);
+    Duration::from_secs(min + entropy % (max - min + 1))
+}
 
 pub async fn run_loop(app: AppHandle, state: Arc<AppState>) {
     let mut next_observation = Instant::now();
@@ -76,8 +89,9 @@ pub async fn run_loop(app: AppHandle, state: Arc<AppState>) {
             if let Err(e) = observe_once(&app, &state, &cfg).await {
                 logging::error(&format!("observe: {e:#}"));
             }
-            next_observation = Instant::now()
-                + Duration::from_secs(cfg.observation_interval_seconds.max(30));
+            let delay = next_observation_delay(&cfg);
+            logging::info(&format!("next automatic observation in {}s", delay.as_secs()));
+            next_observation = Instant::now() + delay;
         }
 
         sleep(Duration::from_secs(SCHEDULER_TICK_SECONDS)).await;
@@ -97,7 +111,11 @@ pub async fn observe_once(app: &AppHandle, state: &Arc<AppState>, cfg: &config::
 
     if cfg.gemini_api_key.trim().is_empty() { return Ok(()); }
     let end = Utc::now();
-    let start = end - ChronoDuration::minutes(cfg.observation_window_minutes.max(1));
+    // Cover at least the maximum automatic interval so a 5-10 minute cadence
+    // cannot leave unseen gaps between snapshots.
+    let cadence_window = ((cfg.observation_interval_max_seconds + 59) / 60) as i64;
+    let window_minutes = cfg.observation_window_minutes.max(cadence_window).max(1);
+    let start = end - ChronoDuration::minutes(window_minutes);
     let mut snapshot = screenpipe::collect(&state.http, &cfg.screenpipe_url, &cfg.screenpipe_api_key, start, end).await?;
     snapshot.phone = db::phone_summary_since(&state.db_path, &start.to_rfc3339())?;
     let recent = db::recent_observations(&state.db_path, 8)?;

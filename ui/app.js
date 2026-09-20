@@ -20,7 +20,10 @@ function fillConfig(c) {
   $('cfg-user-name').value = c.user_name;
   $('cfg-screenpipe-key').value = c.screenpipe_api_key || '';
   $('cfg-gemini-key').value = c.gemini_api_key;
-  $('cfg-interval').value = c.observation_interval_seconds;
+  $('cfg-cloudflare-account').value = c.cloudflare_account_id || '';
+  $('cfg-cloudflare-token').value = c.cloudflare_api_token || '';
+  $('cfg-interval-min').value = Math.round((c.observation_interval_min_seconds || 300) / 60);
+  $('cfg-interval-max').value = Math.round((c.observation_interval_max_seconds || 600) / 60);
   $('cfg-gap').value = c.minimum_notification_gap_minutes;
   $('cfg-persona').value = c.persona;
 }
@@ -207,7 +210,10 @@ $('save-settings').addEventListener('click', async () => {
     user_name:$('cfg-user-name').value.trim() || 'あなた',
     screenpipe_api_key:$('cfg-screenpipe-key').value.trim(),
     gemini_api_key:$('cfg-gemini-key').value.trim(),
-    observation_interval_seconds:Number($('cfg-interval').value) || 300,
+    cloudflare_account_id:$('cfg-cloudflare-account').value.trim(),
+    cloudflare_api_token:$('cfg-cloudflare-token').value.trim(),
+    observation_interval_min_seconds:(Number($('cfg-interval-min').value) || 5) * 60,
+    observation_interval_max_seconds:(Number($('cfg-interval-max').value) || 10) * 60,
     minimum_notification_gap_minutes:Number($('cfg-gap').value) || 20,
     persona:$('cfg-persona').value
   };

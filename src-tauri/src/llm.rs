@@ -1,9 +1,123 @@
 use crate::{config::AppConfig, logging, models::{ActivitySnapshot, ChatMessage, ObservationDecision, StoredObservation}};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::time::Duration;
+
+
+const GOOGLE_FAST_TIMEOUT_SECS: u64 = 12;
+const CLOUDFLARE_TIMEOUT_SECS: u64 = 18;
+const GOOGLE_CIRCUIT_SECONDS: i64 = 10 * 60;
+static GOOGLE_UNHEALTHY_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+fn cloudflare_configured(cfg: &AppConfig) -> bool {
+    !cfg.cloudflare_account_id.trim().is_empty()
+        && !cfg.cloudflare_api_token.trim().is_empty()
+        && !cfg.cloudflare_model.trim().is_empty()
+}
+
+fn google_circuit_open() -> bool {
+    chrono::Utc::now().timestamp() < GOOGLE_UNHEALTHY_UNTIL.load(Ordering::Relaxed)
+}
+
+fn mark_google_unhealthy(reason: &str) {
+    let until = chrono::Utc::now().timestamp() + GOOGLE_CIRCUIT_SECONDS;
+    GOOGLE_UNHEALTHY_UNTIL.store(until, Ordering::Relaxed);
+    logging::warn(&format!(
+        "Google AI temporarily bypassed for {} minutes after infrastructure error: {}",
+        GOOGLE_CIRCUIT_SECONDS / 60,
+        reason
+    ));
+}
+
+fn clear_google_circuit() {
+    GOOGLE_UNHEALTHY_UNTIL.store(0, Ordering::Relaxed);
+}
+
+fn is_google_infrastructure_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("http 500")
+        || text.contains("http 502")
+        || text.contains("http 503")
+        || text.contains("http 504")
+        || text.contains("http 408")
+        || text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("error sending request")
+        || text.contains("connection reset")
+        || text.contains("connection refused")
+        || text.contains("connect error")
+}
+
+async fn cloudflare_text(
+    client: &Client,
+    cfg: &AppConfig,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String> {
+    if !cloudflare_configured(cfg) {
+        return Err(anyhow!("Cloudflare Workers AI is not configured"));
+    }
+    let model = cfg.cloudflare_model.trim();
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/{}",
+        cfg.cloudflare_account_id.trim(), model
+    );
+    let body = json!({
+        "messages": [
+            {"role":"system", "content": system},
+            {"role":"user", "content": prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "options": {"rejectIfBusy": true}
+    });
+    let response = client.post(&url)
+        .bearer_auth(cfg.cloudflare_api_token.trim())
+        .timeout(Duration::from_secs(CLOUDFLARE_TIMEOUT_SECS))
+        .json(&body)
+        .send().await
+        .context("Cloudflare Workers AI request")?;
+    let status = response.status();
+    let raw = response.text().await.context("read Cloudflare Workers AI response")?;
+    if !status.is_success() {
+        return Err(anyhow!("Cloudflare Workers AI: HTTP {status}: {}", raw.trim()));
+    }
+    let envelope: Value = serde_json::from_str(&raw).context("parse Cloudflare Workers AI response")?;
+    if envelope.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err(anyhow!("Cloudflare Workers AI returned failure: {}", raw.trim()));
+    }
+    let response_value = envelope.pointer("/result/response")
+        .ok_or_else(|| anyhow!("Cloudflare Workers AI returned no result.response"))?;
+    if let Some(text) = response_value.as_str() {
+        if !text.trim().is_empty() {
+            return Ok(text.trim().to_string());
+        }
+    } else if response_value.is_object() || response_value.is_array() {
+        return Ok(serde_json::to_string(response_value)?);
+    }
+    Err(anyhow!("Cloudflare Workers AI returned an empty response"))
+}
+
+async fn observe_with_cloudflare(
+    client: &Client,
+    cfg: &AppConfig,
+    prompt: &str,
+) -> Result<ObservationDecision> {
+    let text = cloudflare_text(
+        client,
+        cfg,
+        "Return exactly one valid JSON object and nothing else. Do not use Markdown fences. All required keys must be present. focus_level must be a number from 0 to 1, never a word such as high/medium/low. Japanese string values are preferred.",
+        prompt,
+        420,
+        0.25,
+    ).await?;
+    parse_observation_decision(&text).context("validate observation from Cloudflare Workers AI")
+}
 
 fn local_time_label_now() -> String {
     let now = Local::now();
@@ -135,6 +249,7 @@ async fn observe_with_google_model(
 
     let response = client.post(&url)
         .header("x-goog-api-key", cfg.gemini_api_key.trim())
+        .timeout(Duration::from_secs(GOOGLE_FAST_TIMEOUT_SECS))
         .json(&body)
         .send().await
         .with_context(|| format!("observation request to {model}"))?;
@@ -145,6 +260,7 @@ async fn observe_with_google_model(
         return Err(anyhow!("Google AI {model}: HTTP {status}: {}", response_body.trim()));
     }
 
+    clear_google_circuit();
     let res: Value = serde_json::from_str(&response_body)
         .with_context(|| format!("parse {model} response envelope"))?;
     let text = extract_gemini_text(&res).ok_or_else(|| {
@@ -191,6 +307,7 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
 - activity/summaryは事実ベース。分からないことは断定しない。
 - notification_hintは、実際の台詞ではなく「何についてどう声をかけたいか」を短く書く。
 - 次のキーをすべて含むJSONオブジェクトだけを返す: activity, working, focus_level, summary, active_app, mood, should_speak, speak_reason, intent, notification_hint。
+- focus_level は 0.0〜1.0 の数値にする。"high" / "medium" / "low" のような文字列は使わない。
 - 入力イベントが0でも、それだけで離席・非作業とは判断しない。「入力イベントが発生していない」という事実を、ユーザーが何もしていない証拠として扱わない。
 - ドキュメント閲覧、コードレビュー、調査、動画・資料の確認などは、キーボード入力がなくても作業であり得る。
 - working と focus_level は、入力数だけでなく、画面内容、開いているアプリ、ウィンドウタイトル、スクロール、直前の観察履歴を総合して判断する。
@@ -230,6 +347,21 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
         cfg.observer_last_fallback_model.as_str(),
     ];
     let mut errors = Vec::new();
+    let mut cloudflare_tried = false;
+
+    if google_circuit_open() && cloudflare_configured(cfg) {
+        logging::info("Google AI cooldown active; using Cloudflare Workers AI for observation");
+        cloudflare_tried = true;
+        match observe_with_cloudflare(client, cfg, &prompt).await {
+            Ok(decision) => return Ok(decision),
+            Err(e) => {
+                let message = format!("Cloudflare observation fallback failed: {e:#}");
+                logging::warn(&message);
+                errors.push(message);
+            }
+        }
+    }
+
     for (index, model) in models.iter().enumerate() {
         match observe_with_google_model(client, cfg, model, &prompt, &schema).await {
             Ok(decision) => {
@@ -241,12 +373,42 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
             Err(e) => {
                 let message = format!("observation model {model} failed: {e:#}");
                 errors.push(message.clone());
+                let infrastructure = is_google_infrastructure_error(&e);
+                let rate_limited = is_rate_limit_error(&e);
+                if infrastructure {
+                    mark_google_unhealthy(&message);
+                }
+                if (infrastructure || rate_limited) && !cloudflare_tried && cloudflare_configured(cfg) {
+                    cloudflare_tried = true;
+                    logging::warn("switching observation to Cloudflare Workers AI");
+                    match observe_with_cloudflare(client, cfg, &prompt).await {
+                        Ok(decision) => {
+                            logging::info("observation fallback succeeded with Cloudflare Workers AI");
+                            return Ok(decision);
+                        }
+                        Err(cf_err) => {
+                            let cf_message = format!("Cloudflare observation fallback failed: {cf_err:#}");
+                            logging::warn(&cf_message);
+                            errors.push(cf_message);
+                        }
+                    }
+                }
                 if index + 1 < models.len() {
                     logging::warn(&format!("{message}; falling back to {}", models[index + 1]));
                 } else {
                     logging::error(&message);
                 }
             }
+        }
+    }
+
+    if !cloudflare_tried && cloudflare_configured(cfg) {
+        match observe_with_cloudflare(client, cfg, &prompt).await {
+            Ok(decision) => {
+                logging::info("observation final fallback succeeded with Cloudflare Workers AI");
+                return Ok(decision);
+            }
+            Err(e) => errors.push(format!("Cloudflare observation fallback failed: {e:#}")),
         }
     }
 
@@ -342,7 +504,7 @@ pub async fn diary(client: &Client, cfg: &AppConfig, date: &str, observations: &
 今日の会話（PCローカル時刻）:
 {}"#,
         cfg.persona, local_time_label_now(), date, serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?);
-    gemini_text(client, cfg, &cfg.diary_model, &prompt, 2200, 0.88).await
+    diary_text_with_fallback(client, cfg, &prompt, 2200, 0.88).await
 }
 
 fn extract_gemini_text(res: &Value) -> Option<String> {
@@ -374,72 +536,17 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
         || text.to_ascii_lowercase().contains("rate limit")
 }
 
-async fn chat_text_with_fallback(
-    client: &Client,
-    cfg: &AppConfig,
-    prompt: &str,
-    max_tokens: u32,
-    temperature: f32,
-) -> Result<String> {
-    let models = [
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-    ];
-
-    let mut rate_errors = Vec::new();
-    for (index, model) in models.iter().enumerate() {
-        match gemini_text_with_policy(
-            client, cfg, model, prompt, max_tokens, temperature, false,
-        ).await {
-            Ok(text) => {
-                if index > 0 {
-                    logging::info(&format!("chat fallback succeeded with {model}"));
-                }
-                return Ok(text);
-            }
-            Err(e) if is_rate_limit_error(&e) => {
-                let message = format!("chat model {model} rate-limited: {e:#}");
-                rate_errors.push(message.clone());
-                if index + 1 < models.len() {
-                    logging::warn(&format!(
-                        "{message}; falling back to {}", models[index + 1]
-                    ));
-                    continue;
-                }
-                logging::error(&message);
-            }
-            Err(e) => {
-                // Authentication errors, malformed requests, safety failures,
-                // etc. should remain visible instead of being hidden by a
-                // model switch. Only quota/rate-limit 429s advance the chain.
-                return Err(e);
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "all chat models are rate-limited: {}",
-        rate_errors.join(" | ")
-    ))
-}
-
-async fn gemini_text(client: &Client, cfg: &AppConfig, model: &str, prompt: &str, max_tokens: u32, temperature: f32) -> Result<String> {
-    gemini_text_with_policy(client, cfg, model, prompt, max_tokens, temperature, true).await
-}
-
-async fn gemini_text_with_policy(
+async fn gemini_text_once(
     client: &Client,
     cfg: &AppConfig,
     model: &str,
     prompt: &str,
     max_tokens: u32,
     temperature: f32,
-    retry_rate_limit: bool,
 ) -> Result<String> {
-    if cfg.gemini_api_key.trim().is_empty() { return Err(anyhow!("Gemini API key is not configured")); }
+    if cfg.gemini_api_key.trim().is_empty() {
+        return Err(anyhow!("Gemini API key is not configured"));
+    }
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model);
     let body = json!({
         "contents": [{"role":"user","parts":[{"text":prompt}]}],
@@ -448,53 +555,145 @@ async fn gemini_text_with_policy(
             "maxOutputTokens": max_tokens
         }
     });
+    let response = client.post(&url)
+        .header("x-goog-api-key", cfg.gemini_api_key.trim())
+        .timeout(Duration::from_secs(GOOGLE_FAST_TIMEOUT_SECS))
+        .json(&body)
+        .send().await
+        .with_context(|| format!("Gemini request to {model}"))?;
+    let status = response.status();
+    let response_body = response.text().await.context("read Gemini response")?;
+    if !status.is_success() {
+        return Err(anyhow!("Gemini API {model}: HTTP {status}: {}", response_body.trim()));
+    }
+    clear_google_circuit();
+    let res: Value = serde_json::from_str(&response_body).context("parse Gemini response JSON")?;
+    if let Some(text) = extract_gemini_text(&res) {
+        return Ok(text);
+    }
+    let finish_reason = res.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("unknown");
+    let block_reason = res.pointer("/promptFeedback/blockReason").and_then(Value::as_str).unwrap_or("none");
+    Err(anyhow!("Gemini {model} returned no text (finishReason={finish_reason}, blockReason={block_reason})"))
+}
 
-    let mut last_error = String::new();
-    for attempt in 0..3u32 {
-        let response = match client.post(&url)
-            .header("x-goog-api-key", cfg.gemini_api_key.trim())
-            .json(&body)
-            .send().await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last_error = format!("Gemini request: {e}");
-                if attempt < 2 {
-                    logging::warn(&format!("{last_error}; retry {}/3", attempt + 1));
-                    sleep(Duration::from_secs(1u64 << attempt)).await;
-                    continue;
-                }
-                logging::error(&last_error);
-                return Err(anyhow!(last_error));
-            }
-        };
+async fn chat_text_with_fallback(
+    client: &Client,
+    cfg: &AppConfig,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String> {
+    const MODELS: [&str; 5] = [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ];
 
-        let status = response.status();
-        let response_body = response.text().await.context("read Gemini response")?;
-        if !status.is_success() {
-            last_error = format!("Gemini API: HTTP {status}: {}", response_body.trim());
-            let transient = status.is_server_error()
-                || (retry_rate_limit && status == StatusCode::TOO_MANY_REQUESTS);
-            if transient && attempt < 2 {
-                logging::warn(&format!("{last_error}; retry {}/3", attempt + 1));
-                sleep(Duration::from_secs(1u64 << attempt)).await;
-                continue;
-            }
-            logging::error(&last_error);
-            return Err(anyhow!(last_error));
+    if google_circuit_open() && cloudflare_configured(cfg) {
+        logging::info("Google AI cooldown active; using Cloudflare Workers AI for chat");
+        match cloudflare_text(
+            client, cfg,
+            "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+            prompt, max_tokens, temperature,
+        ).await {
+            Ok(text) => return Ok(text),
+            Err(e) => logging::warn(&format!("Cloudflare chat during Google cooldown failed: {e:#}; probing Google fallbacks")),
         }
-
-        let res: Value = serde_json::from_str(&response_body).context("parse Gemini response JSON")?;
-        if let Some(text) = extract_gemini_text(&res) {
-            return Ok(text);
-        }
-
-        let finish_reason = res.pointer("/candidates/0/finishReason").and_then(Value::as_str).unwrap_or("unknown");
-        let block_reason = res.pointer("/promptFeedback/blockReason").and_then(Value::as_str).unwrap_or("none");
-        let message = format!("Gemini returned no text (finishReason={finish_reason}, blockReason={block_reason})");
-        logging::error(&message);
-        return Err(anyhow!(message));
     }
 
-    Err(anyhow!(if last_error.is_empty() { "Gemini request failed".to_string() } else { last_error }))
+    let mut errors = Vec::new();
+    let mut cloudflare_tried = false;
+    for (index, model) in MODELS.iter().enumerate() {
+        match gemini_text_once(client, cfg, model, prompt, max_tokens, temperature).await {
+            Ok(text) => {
+                if index > 0 { logging::info(&format!("chat fallback succeeded with {model}")); }
+                return Ok(text);
+            }
+            Err(e) if is_rate_limit_error(&e) => {
+                let message = format!("chat model {model} rate-limited: {e:#}");
+                errors.push(message.clone());
+                if index + 1 < MODELS.len() {
+                    logging::warn(&format!("{message}; falling back to {}", MODELS[index + 1]));
+                    continue;
+                }
+                logging::warn(&message);
+            }
+            Err(e) if is_google_infrastructure_error(&e) => {
+                let message = format!("chat model {model} infrastructure failure: {e:#}");
+                errors.push(message.clone());
+                mark_google_unhealthy(&message);
+                if cloudflare_configured(cfg) {
+                    cloudflare_tried = true;
+                    logging::warn("switching chat to Cloudflare Workers AI");
+                    match cloudflare_text(
+                        client, cfg,
+                        "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+                        prompt, max_tokens, temperature,
+                    ).await {
+                        Ok(text) => {
+                            logging::info("chat fallback succeeded with Cloudflare Workers AI");
+                            return Ok(text);
+                        }
+                        Err(cf_err) => {
+                            let cf_message = format!("Cloudflare chat fallback failed: {cf_err:#}");
+                            logging::warn(&cf_message);
+                            errors.push(cf_message);
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if !cloudflare_tried && cloudflare_configured(cfg) {
+        match cloudflare_text(
+            client, cfg,
+            "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+            prompt, max_tokens, temperature,
+        ).await {
+            Ok(text) => {
+                logging::info("chat final fallback succeeded with Cloudflare Workers AI");
+                return Ok(text);
+            }
+            Err(e) => errors.push(format!("Cloudflare chat fallback failed: {e:#}")),
+        }
+    }
+
+    Err(anyhow!("all chat providers failed: {}", errors.join(" | ")))
+}
+
+async fn diary_text_with_fallback(
+    client: &Client,
+    cfg: &AppConfig,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String> {
+    if google_circuit_open() && cloudflare_configured(cfg) {
+        logging::info("Google AI cooldown active; using Cloudflare Workers AI for diary");
+        return cloudflare_text(
+            client, cfg,
+            "Write the requested private diary entry in natural Japanese, following the persona and diary instructions. Do not mention models, providers, or fallback behavior.",
+            prompt, max_tokens, temperature,
+        ).await;
+    }
+    match gemini_text_once(client, cfg, &cfg.diary_model, prompt, max_tokens, temperature).await {
+        Ok(text) => Ok(text),
+        Err(e) if (is_google_infrastructure_error(&e) || is_rate_limit_error(&e)) && cloudflare_configured(cfg) => {
+            if is_google_infrastructure_error(&e) {
+                mark_google_unhealthy(&format!("diary: {e:#}"));
+            }
+            logging::warn(&format!("diary Gemini failed ({e:#}); switching to Cloudflare Workers AI"));
+            cloudflare_text(
+                client, cfg,
+                "Write the requested private diary entry in natural Japanese, following the persona and diary instructions. Do not mention models, providers, or fallback behavior.",
+                prompt, max_tokens, temperature,
+            ).await
+        }
+        Err(e) => Err(e),
+    }
 }

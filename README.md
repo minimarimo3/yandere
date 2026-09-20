@@ -192,7 +192,7 @@ cargo tauri build
 - Chat/proactive messages use Gemini 3.7 Flash → 3.6 Flash → 3.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite, falling back only on HTTP 429 rate/quota exhaustion.
 - Keeps the 30-second idle capture floor (`--idle-capture-interval-ms 30000`).
 
-## Android / Tailscale activity receiver (v0.1.15)
+## Android / Tailscale activity receiver (v0.1.16)
 
 The macOS app now starts a small HTTP receiver on the Mac's **Tailscale IPv4 address only**. It does not bind to the normal LAN interface. The settings screen shows the resolved endpoint and a per-install Bearer token.
 
@@ -255,3 +255,8 @@ curl -X POST \
     "phone_minutes_20m":3.0
   }'
 ```
+
+
+## Cloudflare Workers AI fallback (v0.1.16)
+
+Set your Cloudflare Account ID and a Workers AI API Token in Settings. Google requests use a short per-request timeout; timeout/5xx opens a 10-minute circuit breaker and routes observation/chat/diary fallback to `@cf/google/gemma-4-26b-a4b-it`. Automatic observation cadence defaults to a random 5–10 minutes, with a lookback window large enough to cover the maximum interval.
