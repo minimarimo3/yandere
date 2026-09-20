@@ -485,6 +485,7 @@ pub async fn collect(client: &Client, base: &str, api_key: &str, start: DateTime
         observed_records: records,
         idle_seconds_estimate: idle,
         transient_text_snippets: snippets,
+        phone: None,
     })
 }
 

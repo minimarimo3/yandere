@@ -16,6 +16,9 @@ pub struct AppConfig {
     pub diary_model: String,
     pub screenpipe_url: String,
     pub screenpipe_api_key: String,
+    pub phone_receiver_enabled: bool,
+    pub phone_receiver_port: u16,
+    pub phone_receiver_token: String,
     pub observation_interval_seconds: u64,
     pub observation_window_minutes: i64,
     pub minimum_notification_gap_minutes: i64,
@@ -38,6 +41,9 @@ impl Default for AppConfig {
             diary_model: "gemini-3.8-flash".into(),
             screenpipe_url: "http://127.0.0.1:3030".into(),
             screenpipe_api_key: String::new(),
+            phone_receiver_enabled: true,
+            phone_receiver_port: 38465,
+            phone_receiver_token: String::new(),
             observation_interval_seconds: 300,
             observation_window_minutes: 5,
             minimum_notification_gap_minutes: 20,
@@ -74,7 +80,8 @@ pub fn config_path(base: &Path) -> PathBuf { base.join("config.toml") }
 pub fn load(base: &Path) -> Result<AppConfig> {
     let path = config_path(base);
     if !path.exists() {
-        let cfg = AppConfig::default();
+        let mut cfg = AppConfig::default();
+        cfg.phone_receiver_token = format!("yc-{}", uuid::Uuid::new_v4());
         save(base, &cfg)?;
         return Ok(cfg);
     }
@@ -87,6 +94,14 @@ pub fn load(base: &Path) -> Result<AppConfig> {
     // contains Groq credentials/model settings, rewrite it once without those
     // obsolete fields so the key is not kept around unnecessarily.
     if raw.contains("groq_api_key") || raw.contains("groq_model") {
+        changed = true;
+    }
+    if cfg.phone_receiver_token.trim().is_empty() {
+        cfg.phone_receiver_token = format!("yc-{}", uuid::Uuid::new_v4());
+        changed = true;
+    }
+    if cfg.phone_receiver_port == 0 {
+        cfg.phone_receiver_port = 38465;
         changed = true;
     }
     if cfg.persona.trim() == OLD_DEFAULT_PERSONA.trim() {

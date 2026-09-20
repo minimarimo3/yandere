@@ -66,3 +66,7 @@ button.compact { padding:5px 8px; border-radius:8px; font-size:10px; }
 .health-badge.bad { background:#f6e5e8; color:#9a4855; }
 .health-badge.pending { background:#eeeaf2; color:#746a80; }
 .health-detail { margin:2px 0 0; word-break:break-word; }
+
+.phone-card { border:1px solid #e1e5ee; background:#fafbfe; border-radius:12px; padding:10px 11px; display:flex; flex-direction:column; gap:7px; }
+.phone-meta { display:grid; grid-template-columns:62px 1fr; gap:8px; align-items:start; font-size:10px; color:#77656f; }
+.phone-meta code { font-size:9px; line-height:1.45; word-break:break-all; white-space:normal; color:#5b6070; user-select:text; }

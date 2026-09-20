@@ -191,3 +191,67 @@ cargo tauri build
 - Settings now shows detailed screenpipe health: screen capture, Accessibility, Input Monitoring, UI recorder state, and inserted input event count.
 - Chat/proactive messages use Gemini 3.7 Flash → 3.6 Flash → 3.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite, falling back only on HTTP 429 rate/quota exhaustion.
 - Keeps the 30-second idle capture floor (`--idle-capture-interval-ms 30000`).
+
+## Android / Tailscale activity receiver (v0.1.15)
+
+The macOS app now starts a small HTTP receiver on the Mac's **Tailscale IPv4 address only**. It does not bind to the normal LAN interface. The settings screen shows the resolved endpoint and a per-install Bearer token.
+
+Default endpoint:
+
+```text
+http://<Mac Tailscale 100.x address>:38465/v1/phone/activity
+```
+
+Authentication:
+
+```http
+Authorization: Bearer <Token shown in Yandere Companion settings>
+Content-Type: application/json
+```
+
+Example payload expected from the future Android app:
+
+```json
+{
+  "device_id": "pixel-9a",
+  "device_name": "Pixel 9a",
+  "observed_at": "2026-09-20T18:45:30+09:00",
+  "interactive": true,
+  "unlocked": true,
+  "foreground_app": "YouTube",
+  "foreground_package": "com.google.android.youtube",
+  "session_seconds": 184,
+  "last_interaction_seconds_ago": 3,
+  "clicks_1m": 7,
+  "scrolls_1m": 22,
+  "app_switches_5m": 4,
+  "pickups_20m": 6,
+  "phone_minutes_20m": 5.4,
+  "longest_session_seconds_20m": 184
+}
+```
+
+All rolling counters except `device_id` / `device_name` may be omitted while the Android implementation is being developed. The Mac stores accepted samples in `companion.sqlite3` and folds recent phone activity into the same observation snapshot sent to the Gemma observer.
+
+While the companion is sleeping, the receiver stays reachable but returns `202 Accepted` and does **not** store incoming activity.
+
+You can test the receiver from another tailnet device with:
+
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <TOKEN>' \
+  '<ENDPOINT>' \
+  -d '{
+    "device_id":"test-phone",
+    "device_name":"Test Android",
+    "interactive":true,
+    "unlocked":true,
+    "foreground_app":"YouTube",
+    "foreground_package":"com.google.android.youtube",
+    "session_seconds":90,
+    "scrolls_1m":12,
+    "pickups_20m":4,
+    "phone_minutes_20m":3.0
+  }'
+```

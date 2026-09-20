@@ -98,7 +98,8 @@ pub async fn observe_once(app: &AppHandle, state: &Arc<AppState>, cfg: &config::
     if cfg.gemini_api_key.trim().is_empty() { return Ok(()); }
     let end = Utc::now();
     let start = end - ChronoDuration::minutes(cfg.observation_window_minutes.max(1));
-    let snapshot = screenpipe::collect(&state.http, &cfg.screenpipe_url, &cfg.screenpipe_api_key, start, end).await?;
+    let mut snapshot = screenpipe::collect(&state.http, &cfg.screenpipe_url, &cfg.screenpipe_api_key, start, end).await?;
+    snapshot.phone = db::phone_summary_since(&state.db_path, &start.to_rfc3339())?;
     let recent = db::recent_observations(&state.db_path, 8)?;
     let decision = llm::observe_and_decide(&state.http, cfg, &snapshot, &recent).await?;
 

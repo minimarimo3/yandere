@@ -61,6 +61,37 @@ function renderScreenpipeHealth(h, sleeping = false) {
   }
   $('health-detail').textContent = bits.join(' · ') || '状態を取得しました。';
 }
+function renderPhoneReceiver(p) {
+  p = p || {};
+  const server = $('phone-server');
+  server.className = `health-badge ${p.running ? 'good' : 'bad'}`;
+  server.textContent = p.running ? '待受中' : (p.enabled === false ? '無効' : '停止中');
+
+  const latest = p.latest_activity;
+  const device = $('phone-device');
+  const seenAt = p.last_seen_at ? new Date(p.last_seen_at) : null;
+  const seenAgeMs = seenAt && !Number.isNaN(seenAt.getTime()) ? Date.now() - seenAt.getTime() : Infinity;
+  const recent = Boolean(latest && seenAgeMs <= 120000);
+  device.className = `health-badge ${recent ? 'good' : 'pending'}`;
+  device.textContent = recent ? (latest.device_name || '接続中') : (latest ? 'しばらく未受信' : '未接続');
+
+  $('phone-endpoint').textContent = p.endpoint || '-';
+  $('phone-token').textContent = data?.config?.phone_receiver_token || '-';
+  $('phone-last-seen').textContent = seenAt && !Number.isNaN(seenAt.getTime())
+    ? seenAt.toLocaleString([], {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'})
+    : '-';
+
+  if (latest) {
+    const app = latest.foreground_app || latest.foreground_package || 'アプリ不明';
+    const state = latest.unlocked ? (latest.interactive ? '操作中' : '画面ON') : 'ロック中';
+    const session = latest.session_seconds != null ? ` · ${Math.floor(latest.session_seconds / 60)}分${latest.session_seconds % 60}秒` : '';
+    $('phone-current').textContent = `${state} · ${app}${session}`;
+  } else {
+    $('phone-current').textContent = '-';
+  }
+  $('phone-detail').textContent = p.detail || 'Androidからの状態を待っています。';
+}
+
 function renderBootstrap(d) {
   data = d; fillConfig(d.config); renderMessages(d.messages);
   const sleeping = Boolean(d.rhythm?.sleeping);
@@ -113,6 +144,7 @@ function renderBootstrap(d) {
   $('make-diary').disabled = sleeping;
   $('chat-input').placeholder = sleeping ? `${d.config.companion_name}は寝ています…` : '話しかける…';
   renderScreenpipeHealth(d.screenpipe_health, sleeping);
+  renderPhoneReceiver(d.phone_receiver);
 
   if (d.today_diary) $('diary-text').textContent = d.today_diary.text;
   $('app-version').textContent = d.app_version || '-';
@@ -149,6 +181,23 @@ $('refresh-health').addEventListener('click', async () => {
   } finally {
     b.disabled = false;
     b.textContent = '再チェック';
+  }
+});
+
+$('refresh-phone').addEventListener('click', async () => {
+  const b = $('refresh-phone');
+  b.disabled = true;
+  b.textContent = '確認中…';
+  try {
+    const p = await invoke('check_phone_receiver');
+    if (data) data.phone_receiver = p;
+    renderPhoneReceiver(p);
+    toast('Android連携の状態を更新しました');
+  } catch(e) {
+    toast(`Android連携エラー: ${e}`);
+  } finally {
+    b.disabled = false;
+    b.textContent = '更新';
   }
 });
 

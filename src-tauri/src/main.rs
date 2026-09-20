@@ -4,12 +4,13 @@ mod db;
 mod llm;
 mod logging;
 mod models;
+mod phone;
 mod rhythm;
 mod screenpipe;
 
 use anyhow::Result;
 use chrono::{Local, Utc};
-use models::{BootstrapData, ChatMessage, DiaryEntry, ScreenpipeHealth};
+use models::{BootstrapData, ChatMessage, DiaryEntry, PhoneReceiverStatus, ScreenpipeHealth};
 use reqwest::Client;
 use std::{
     path::PathBuf,
@@ -42,6 +43,7 @@ pub struct AppState {
     // small search-concurrency budget.
     observation_lock: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
+    phone_status: tokio::sync::RwLock<PhoneReceiverStatus>,
 }
 
 #[tauri::command]
@@ -64,6 +66,7 @@ async fn bootstrap(state: State<'_, Arc<AppState>>) -> Result<BootstrapData, Str
         screenpipe::health_details(&state.http, &cfg.screenpipe_url).await
     };
     let screenpipe_ok = screenpipe_health.observation_ready();
+    let phone_receiver = phone::status(state.inner()).await;
     let log_path = logging::path().unwrap_or_else(|| state.data_dir.join("companion.log"));
     let screenpipe_log_path = state.data_dir.join("screenpipe.log");
     Ok(BootstrapData {
@@ -73,6 +76,7 @@ async fn bootstrap(state: State<'_, Arc<AppState>>) -> Result<BootstrapData, Str
         today_diary,
         screenpipe_ok,
         screenpipe_health,
+        phone_receiver,
         rhythm,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         log_path: log_path.to_string_lossy().into_owned(),
@@ -91,6 +95,11 @@ async fn check_screenpipe_health(state: State<'_, Arc<AppState>>) -> Result<Scre
         });
     }
     Ok(screenpipe::health_details(&state.http, &cfg.screenpipe_url).await)
+}
+
+#[tauri::command]
+async fn check_phone_receiver(state: State<'_, Arc<AppState>>) -> Result<PhoneReceiverStatus, String> {
+    Ok(phone::status(state.inner()).await)
 }
 
 #[tauri::command]
@@ -255,6 +264,7 @@ fn main() {
                 http: Client::builder().timeout(std::time::Duration::from_secs(90)).build()?,
                 observation_lock: tokio::sync::Mutex::new(()),
                 shutting_down: AtomicBool::new(false),
+                phone_status: tokio::sync::RwLock::new(PhoneReceiverStatus::default()),
             });
             app.manage(state.clone());
 
@@ -304,10 +314,11 @@ fn main() {
             let _tray = tray;
 
             let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(agent::run_loop(app_handle, state));
+            tauri::async_runtime::spawn(agent::run_loop(app_handle, state.clone()));
+            tauri::async_runtime::spawn(phone::run_receiver(state));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![bootstrap, check_screenpipe_health, send_message, save_config, generate_diary, observe_now, quit_all])
+        .invoke_handler(tauri::generate_handler![bootstrap, check_screenpipe_health, check_phone_receiver, send_message, save_config, generate_diary, observe_now, quit_all])
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {

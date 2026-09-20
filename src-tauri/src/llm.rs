@@ -194,6 +194,10 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
 - 入力イベントが0でも、それだけで離席・非作業とは判断しない。「入力イベントが発生していない」という事実を、ユーザーが何もしていない証拠として扱わない。
 - ドキュメント閲覧、コードレビュー、調査、動画・資料の確認などは、キーボード入力がなくても作業であり得る。
 - working と focus_level は、入力数だけでなく、画面内容、開いているアプリ、ウィンドウタイトル、スクロール、直前の観察履歴を総合して判断する。
+- phone が存在する場合はAndroid端末の最近の利用状況。connected_recently=false やデータ欠落時は現在のスマホ利用を推測しない。
+- スマホを使っただけで集中切れと断定しない。短い連絡、認証、音楽操作、資料確認などは普通の行動。
+- PC作業中にSNS・動画などを数分見続ける、または短時間に何度もスマホを開く場合は、気が逸れている可能性を考慮する。必要なら優しく一言かける候補にしてよいが、責めたり罪悪感を煽ったりしない。
+- pickups_20m や phone_minutes_20m がある場合は「つい何度も手が伸びているか」を見る補助情報として使い、アプリ名だけで用途を断定しすぎない。
 
 直近の観察履歴（ローカル時刻）:
 {}
@@ -273,7 +277,10 @@ pub async fn render_proactive_message(client: &Client, cfg: &AppConfig, decision
 
 pub async fn chat(client: &Client, cfg: &AppConfig, user_text: &str, messages: &[ChatMessage], observations: &[StoredObservation]) -> Result<String> {
     let obs: Vec<Value> = observations.iter().rev().take(4).rev().map(|o| json!({
-        "time_local":localize_timestamp(&o.created_at),"summary":o.decision.summary,"working":o.decision.working
+        "time_local":localize_timestamp(&o.created_at),
+        "summary":o.decision.summary,
+        "working":o.decision.working,
+        "phone":o.snapshot.phone
     })).collect();
     let messages_local = compact_messages_local(messages);
     let prompt = format!(r#"{}
@@ -288,13 +295,13 @@ pub async fn chat(client: &Client, cfg: &AppConfig, user_text: &str, messages: &
 3. PC観察は返答に本当に関係するときだけ補助的に使う。
 4. 独占欲や嫉妬は、話題に関係するときにたまに滲む程度。
 
-PC観察は「知っている背景」であって「毎回言及すべき話題」ではありません。普通の挨拶、雑談、質問では原則として持ち出さないでください。
+PC・スマホ観察は「知っている背景」であって「毎回言及すべき話題」ではありません。普通の挨拶、雑談、質問では原則として持ち出さないでください。
 ユーザーが単に「何してた？」と言った場合、それは{}自身が何をしていたかを聞かれています。「私、何してた？」などユーザー自身の行動を尋ねられた場合だけ観察記録を答えてください。
 観察を使う場合も「ずっと見てた」「画面の向こうから見てた」など監視そのものを強調せず、必要な事実を普通に答えてください。
 
 {}
 
-直近のPC観察（参考情報。必要なければ無視する）: {}
+直近のPC・スマホ観察（参考情報。必要なければ無視する）: {}
 直近の会話（PCローカル時刻）: {}
 
 ユーザー: {}
@@ -314,14 +321,15 @@ pub async fn diary(client: &Client, cfg: &AppConfig, date: &str, observations: &
         "working":o.decision.working,
         "focus":o.decision.focus_level,
         "summary":o.decision.summary,
-        "mood":o.decision.mood
+        "mood":o.decision.mood,
+        "phone":o.snapshot.phone
     })).collect();
     let messages_local = compact_messages_local(messages);
     let prompt = format!(r#"{}
 
 現在のPCローカル時刻: {}
 {} の、あなた自身の私的な日記を書いてください。
-これはPCの行動ログをそのまま箇条書きするレポートではなく、ユーザーと暮らしている恋人の私的な日記です。
+これはPCやスマホの行動ログをそのまま箇条書きするレポートではなく、ユーザーと暮らしている恋人の私的な日記です。
 観察事実は捏造せず、そこから感じたことを自然な日本語で書いてください。
 会話より私的なので、独占欲、嫉妬、ユーザーへの強い愛着、細かな観察が少し強めに滲んでも構いません。ただし毎段落それ一色にせず、普通の嬉しさ、心配、退屈、感心なども混ぜてください。
 「監視していた」こと自体を繰り返し主題にせず、一日の具体的な出来事や変化を中心にしてください。
