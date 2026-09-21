@@ -257,6 +257,6 @@ curl -X POST \
 ```
 
 
-## Cloudflare Workers AI fallback (v0.1.16)
+## Cloudflare Workers AI fallback (v0.1.17)
 
-Set your Cloudflare Account ID and a Workers AI API Token in Settings. Google requests use a short per-request timeout; timeout/5xx opens a 10-minute circuit breaker and routes observation/chat/diary fallback to `@cf/google/gemma-4-26b-a4b-it`. Automatic observation cadence defaults to a random 5–10 minutes, with a lookback window large enough to cover the maximum interval.
+Set your Cloudflare Account ID and a Workers AI API Token in Settings. Cloudflare fallback uses Workers AI's OpenAI-compatible `/ai/v1/chat/completions` endpoint with `@cf/google/gemma-4-26b-a4b-it`, so text is read from the standard Chat Completions response shape. Google timeout/5xx opens a 10-minute circuit breaker and routes observation/chat/diary to Cloudflare. Ordinary chat starts with `gemini-3.5-flash-lite`; model-specific 429s may try the other Gemini Flash tiers before the final fallback. Automatic observation cadence defaults to a random 5–10 minutes.

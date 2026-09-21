@@ -46,7 +46,7 @@
       <label>Gemini API Key<input id="cfg-gemini-key" type="password" autocomplete="off" /></label>
       <label>Cloudflare Account ID<input id="cfg-cloudflare-account" autocomplete="off" /></label>
       <label>Cloudflare Workers AI API Token<input id="cfg-cloudflare-token" type="password" autocomplete="off" /></label>
-      <p class="tiny model-chain">Googleがタイムアウト/5xxならCloudflare Workers AIの Gemma 4 26B A4B へ即fallbackし、10分間Googleを迂回します。会話の429は従来どおりGoogleのFlash系列を順に使い切った後Cloudflareへfallbackします。</p>
+      <p class="tiny model-chain">Googleがタイムアウト/5xxならCloudflare Workers AIの Gemma 4 26B A4B へ即fallbackし、10分間Googleを迂回します。通常の会話は Gemini 3.5 Flash Lite。429時だけ他のFlash系列を試し、Google自体の障害時はCloudflareへ直行します。</p>
       <div class="health-card">
         <div class="health-head">
           <strong>screenpipe ヘルス</strong>

@@ -51,6 +51,38 @@ fn is_google_infrastructure_error(error: &anyhow::Error) -> bool {
         || text.contains("connect error")
 }
 
+fn extract_cloudflare_chat_text(value: &Value) -> Option<String> {
+    // Workers AI's OpenAI-compatible endpoint returns the standard
+    // Chat Completions shape. Keep a couple of alternate pointers as a
+    // defensive measure in case Cloudflare wraps the response.
+    for pointer in [
+        "/choices/0/message/content",
+        "/result/choices/0/message/content",
+        "/result/response",
+        "/response",
+    ] {
+        let Some(content) = value.pointer(pointer) else { continue; };
+        if let Some(text) = content.as_str() {
+            if !text.trim().is_empty() {
+                return Some(text.trim().to_string());
+            }
+        }
+        if let Some(parts) = content.as_array() {
+            let text = parts.iter()
+                .filter_map(|part| {
+                    part.get("text").and_then(Value::as_str)
+                        .or_else(|| part.get("content").and_then(Value::as_str))
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.trim().is_empty() {
+                return Some(text.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn cloudflare_text(
     client: &Client,
     cfg: &AppConfig,
@@ -62,18 +94,19 @@ async fn cloudflare_text(
     if !cloudflare_configured(cfg) {
         return Err(anyhow!("Cloudflare Workers AI is not configured"));
     }
-    let model = cfg.cloudflare_model.trim();
     let url = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/{}",
-        cfg.cloudflare_account_id.trim(), model
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1/chat/completions",
+        cfg.cloudflare_account_id.trim()
     );
     let body = json!({
+        "model": cfg.cloudflare_model.trim(),
         "messages": [
             {"role":"system", "content": system},
             {"role":"user", "content": prompt}
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": false,
         "options": {"rejectIfBusy": true}
     });
     let response = client.post(&url)
@@ -91,16 +124,8 @@ async fn cloudflare_text(
     if envelope.get("success").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!("Cloudflare Workers AI returned failure: {}", raw.trim()));
     }
-    let response_value = envelope.pointer("/result/response")
-        .ok_or_else(|| anyhow!("Cloudflare Workers AI returned no result.response"))?;
-    if let Some(text) = response_value.as_str() {
-        if !text.trim().is_empty() {
-            return Ok(text.trim().to_string());
-        }
-    } else if response_value.is_object() || response_value.is_array() {
-        return Ok(serde_json::to_string(response_value)?);
-    }
-    Err(anyhow!("Cloudflare Workers AI returned an empty response"))
+    extract_cloudflare_chat_text(&envelope)
+        .ok_or_else(|| anyhow!("Cloudflare Workers AI returned no chat completion text"))
 }
 
 async fn observe_with_cloudflare(
@@ -581,11 +606,14 @@ async fn chat_text_with_fallback(
     max_tokens: u32,
     temperature: f32,
 ) -> Result<String> {
+    // Fast/light model first for ordinary conversation. The larger Flash
+    // models are only quota fallbacks; infrastructure failures jump straight
+    // to Cloudflare instead of walking the Google list.
     const MODELS: [&str; 5] = [
+        "gemini-3.5-flash-lite",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
     ];
 
