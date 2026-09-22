@@ -37,7 +37,11 @@ fn clear_google_circuit() {
 }
 
 fn is_google_infrastructure_error(error: &anyhow::Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
+    // `anyhow::Error::to_string()` only contains the outermost context. Network
+    // errors are wrapped with labels such as "Gemini request to ...", so inspect
+    // the full error chain or a timeout can be misclassified as a normal model
+    // error and never reach the Cloudflare fallback.
+    let text = format!("{error:#}").to_ascii_lowercase();
     text.contains("http 500")
         || text.contains("http 502")
         || text.contains("http 503")
@@ -105,8 +109,13 @@ async fn cloudflare_text(
             {"role":"user", "content": prompt}
         ],
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
         "stream": false,
+        // Gemma 4 has built-in thinking. For this app we want the token budget
+        // spent on the actual answer/JSON, not hidden reasoning. With thinking
+        // enabled, a small completion budget can legitimately end with empty
+        // message.content even though the request itself succeeded.
+        "chat_template_kwargs": {"enable_thinking": false},
         "options": {"rejectIfBusy": true}
     });
     let response = client.post(&url)
@@ -124,8 +133,37 @@ async fn cloudflare_text(
     if envelope.get("success").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!("Cloudflare Workers AI returned failure: {}", raw.trim()));
     }
-    extract_cloudflare_chat_text(&envelope)
-        .ok_or_else(|| anyhow!("Cloudflare Workers AI returned no chat completion text"))
+    extract_cloudflare_chat_text(&envelope).ok_or_else(|| {
+        let finish_reason = envelope
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let content = envelope.pointer("/choices/0/message/content");
+        let content_shape = match content {
+            Some(Value::String(text)) => format!("string(len={})", text.chars().count()),
+            Some(Value::Array(parts)) => format!("array(len={})", parts.len()),
+            Some(Value::Null) => "null".to_string(),
+            Some(other) => format!("{}", match other {
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::Object(_) => "object",
+                _ => "other",
+            }),
+            None => "missing".to_string(),
+        };
+        let reasoning_len = envelope
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(Value::as_str)
+            .map(|s| s.chars().count())
+            .or_else(|| envelope
+                .pointer("/choices/0/message/reasoning")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().count()))
+            .unwrap_or(0);
+        anyhow!(
+            "Cloudflare Workers AI returned no chat completion text (finish_reason={finish_reason}, content={content_shape}, reasoning_chars={reasoning_len})"
+        )
+    })
 }
 
 async fn observe_with_cloudflare(
@@ -136,7 +174,7 @@ async fn observe_with_cloudflare(
     let text = cloudflare_text(
         client,
         cfg,
-        "Return exactly one valid JSON object and nothing else. Do not use Markdown fences. All required keys must be present. focus_level must be a number from 0 to 1, never a word such as high/medium/low. Japanese string values are preferred.",
+        &cfg.observation_system_prompt,
         prompt,
         420,
         0.25,
@@ -181,36 +219,13 @@ fn compact_messages_local(messages: &[ChatMessage]) -> Vec<Value> {
 }
 
 
-const CHAT_BEHAVIOR_EXAMPLES: &str = r#"
-以下は口調と距離感の例。内容をそのまま繰り返すためではなく、普通の恋人が基調で、執着は必要な場面だけ薄く出る程度を示す。
-
-ユーザー: やっほー
-キャラクター: やっほー。どうしたの？
-
-ユーザー: 何してた？
-キャラクター: んー、ちょっとぼんやりしてた。そろそろ来るかなとは思ってたけど。
-
-ユーザー: 疲れた
-キャラクター: おつかれ。今日は結構やってたもんね。少し休んだら？
-
-ユーザー: 私、さっき何してたっけ？
-キャラクター: Rustのコンパイル待ちながら設定をいじってたよ。その前はブラウザも少し見てた。
-
-ユーザー: 友達と遊んできた
-キャラクター: いいな、楽しかった？ 私もちょっとだけ混ざりたかったけど。
-
-ユーザー: 今日はもう作業やめる
-キャラクター: 了解。じゃあ今日は終わり。ちゃんと切り上げられたの偉いじゃん。
-"#;
-
-const PROACTIVE_BEHAVIOR_EXAMPLES: &str = r#"
-自然な通知の例:
-- 「結構集中してるね。いい感じじゃん。」
-- 「さっきから同じところ行ったり来たりしてるけど、詰まってる？」
-- 「一区切りついたっぽいね。少し休む？」
-- 「今日は長いね。終わったら少しくらい私にも時間ちょうだい。」
-避けたい方向: 観察している事実の誇示、毎回の嫉妬、毎回の「ずっと見てた」、恋愛台詞をねじ込むこと。
-"#;
+fn render_prompt_template(template: &str, values: &[(&str, &str)]) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in values {
+        rendered = rendered.replace(&format!("{{{{{key}}}}}"), value);
+    }
+    rendered
+}
 
 fn parse_observation_decision(text: &str) -> Result<ObservationDecision> {
     let mut cleaned = text.trim();
@@ -248,11 +263,6 @@ async fn observe_with_google_model(
 ) -> Result<ObservationDecision> {
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", model);
 
-    // Gemma 4 is deliberately left in ordinary text mode. It is strongly
-    // instructed to emit one JSON object and we validate it locally. This
-    // keeps the primary path compatible even if model-specific structured
-    // output support changes. The final Gemini fallback uses server-enforced
-    // JSON Schema for maximum reliability.
     let mut generation_config = json!({
         "temperature": 0.35,
         "maxOutputTokens": 420
@@ -266,7 +276,7 @@ async fn observe_with_google_model(
 
     let body = json!({
         "systemInstruction": {
-            "parts": [{"text":"Return exactly one valid JSON object and nothing else. Do not use Markdown fences. Japanese string values are preferred."}]
+            "parts": [{"text": cfg.observation_system_prompt.as_str()}]
         },
         "contents": [{"role":"user","parts":[{"text":prompt}]}],
         "generationConfig": generation_config
@@ -313,38 +323,18 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
         localize_timestamp(&snapshot.end_time)
     );
     let now_local = local_time_label_now();
-
-    let prompt = format!(r#"あなたはmacOS常駐キャラクターの観察・発話判断エンジンです。
-以下のPC利用状況から、ユーザーが何をしていたか、実際に作業していたか、集中度、キャラクターの軽い気分、そして今こちらから話しかける価値があるかを判断してください。
-
-現在のPCローカル時刻: {now_local}
-今回の観察区間（PCローカル時刻）: {window_local}
-重要: 朝・昼・夕方・夜・深夜などの判断は、UTC表記ではなく上記のPCローカル時刻を基準にしてください。
-
-キャラクター設定:
-{}
-
-判断方針:
-- 定期的に何度も呼ばれるので、普通は黙る。should_speak=true は珍しくてよい。
-- 基準は「恋人として今ひとこと言うと自然か」。独占欲や嫉妬を理由に発話頻度を上げない。
-- 良い区切り、長い集中、露骨な脱線、長い離席、作業復帰などは話しかける候補。
-- 同じ内容で何度も話しかけない。何も特別なことがなければ黙る。
-- activity/summaryは事実ベース。分からないことは断定しない。
-- notification_hintは、実際の台詞ではなく「何についてどう声をかけたいか」を短く書く。
-- 次のキーをすべて含むJSONオブジェクトだけを返す: activity, working, focus_level, summary, active_app, mood, should_speak, speak_reason, intent, notification_hint。
-- focus_level は 0.0〜1.0 の数値にする。
-- ドキュメント閲覧、コードレビュー、調査、動画・資料の確認などは、スクロールが行われているなら作業であり得る。一切入力がないなら作業はしていない。
-- working と focus_level は、入力数だけでなく、画面内容、開いているアプリ、ウィンドウタイトル、スクロール、直前の観察履歴を総合して判断する。
-- phone が存在する場合はAndroid端末の最近の利用状況。connected_recently=false やデータ欠落時は現在のスマホ利用を推測しない。
-- PC作業中にスマホを見る、短時間に何度もスマホを開く場合は、気が逸れている可能性を考慮する。必要なら優しく一言かける候補にしてよいが、責めたり罪悪感を煽ったりしない。
-- pickups_20m や phone_minutes_20m がある場合は「つい何度も手が伸びているか」を見る補助情報として使い、アプリ名だけで用途を断定しすぎない。
-
-直近の観察履歴（ローカル時刻）:
-{}
-
-今回の観察材料:
-{}
-"#, cfg.persona, serde_json::to_string(&recent_compact)?, serde_json::to_string(snapshot)?);
+    let recent_json = serde_json::to_string(&recent_compact)?;
+    let snapshot_json = serde_json::to_string(snapshot)?;
+    let prompt = render_prompt_template(
+        &cfg.observation_prompt_template,
+        &[
+            ("persona", &cfg.persona),
+            ("now_local", &now_local),
+            ("window_local", &window_local),
+            ("recent_observations", &recent_json),
+            ("snapshot", &snapshot_json),
+        ],
+    );
 
     let schema = json!({
       "type":"object",
@@ -440,23 +430,19 @@ pub async fn observe_and_decide(client: &Client, cfg: &AppConfig, snapshot: &Act
 
 pub async fn render_proactive_message(client: &Client, cfg: &AppConfig, decision: &ObservationDecision, recent_messages: &[ChatMessage]) -> Result<String> {
     let messages = compact_messages_local(recent_messages);
-    let prompt = format!(r#"{}
-
-現在のPCローカル時刻: {}
-今、あなたは恋人に自分から短く声をかけようとしています。
-観察結果: {}
-話しかけたい意図: {}
-参考メモ: {}
-
-{}
-
-通知として自然な日本語を1〜2文で書いてください。説明や引用符は不要です。
-最優先は普通の恋人として自然であること。PCを見ていた事実を証明しようとせず、観察内容は必要なら一つだけ具体的に使ってください。
-独占欲や嫉妬は、この状況に本当に合う場合だけ薄く混ぜます。毎回は入れません。
-直近の会話と似た言い回しは避けてください。
-直近の会話（PCローカル時刻）: {}"#,
-        cfg.persona, local_time_label_now(), decision.summary, decision.intent, decision.notification_hint,
-        PROACTIVE_BEHAVIOR_EXAMPLES, serde_json::to_string(&messages)?);
+    let now_local = local_time_label_now();
+    let messages_json = serde_json::to_string(&messages)?;
+    let prompt = render_prompt_template(
+        &cfg.proactive_prompt_template,
+        &[
+            ("persona", &cfg.persona),
+            ("now_local", &now_local),
+            ("decision_summary", &decision.summary),
+            ("decision_intent", &decision.intent),
+            ("notification_hint", &decision.notification_hint),
+            ("recent_messages", &messages_json),
+        ],
+    );
     chat_text_with_fallback(client, cfg, &prompt, 240, 0.72).await
 }
 
@@ -468,32 +454,21 @@ pub async fn chat(client: &Client, cfg: &AppConfig, user_text: &str, messages: &
         "phone":o.snapshot.phone
     })).collect();
     let messages_local = compact_messages_local(messages);
-    let prompt = format!(r#"{}
-
-あなたはメニューバーから恋人のユーザーと話しています。
-現在のPCローカル時刻: {}
-ユーザー名: {}
-
-会話での優先順位:
-1. いまのユーザーの発言そのものに自然に返す。
-2. 恋人としてのいつもの距離感を保つ。
-3. PC観察は返答に本当に関係するときだけ補助的に使う。
-4. 独占欲や嫉妬は、話題に関係するときにたまに滲む程度。
-
-PC・スマホ観察は「知っている背景」であって「毎回言及すべき話題」ではありません。普通の挨拶、雑談、質問では原則として持ち出さないでください。
-ユーザーが単に「何してた？」と言った場合、それは{}自身が何をしていたかを聞かれています。「私、何してた？」などユーザー自身の行動を尋ねられた場合だけ観察記録を答えてください。
-観察を使う場合も「ずっと見てた」「画面の向こうから見てた」など監視そのものを強調せず、必要な事実を普通に答えてください。
-
-{}
-
-直近のPC・スマホ観察（参考情報。必要なければ無視する）: {}
-直近の会話（PCローカル時刻）: {}
-
-ユーザー: {}
-
-通常は1〜3文で自然に返してください。毎回質問で終えなくて構いません。"#,
-        cfg.persona, local_time_label_now(), cfg.user_name, cfg.companion_name, CHAT_BEHAVIOR_EXAMPLES,
-        serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?, user_text);
+    let now_local = local_time_label_now();
+    let observations_json = serde_json::to_string(&obs)?;
+    let messages_json = serde_json::to_string(&messages_local)?;
+    let prompt = render_prompt_template(
+        &cfg.chat_prompt_template,
+        &[
+            ("persona", &cfg.persona),
+            ("now_local", &now_local),
+            ("user_name", &cfg.user_name),
+            ("companion_name", &cfg.companion_name),
+            ("observations", &observations_json),
+            ("recent_messages", &messages_json),
+            ("user_text", user_text),
+        ],
+    );
     chat_text_with_fallback(client, cfg, &prompt, 520, 0.72).await
 }
 
@@ -510,23 +485,19 @@ pub async fn diary(client: &Client, cfg: &AppConfig, date: &str, observations: &
         "phone":o.snapshot.phone
     })).collect();
     let messages_local = compact_messages_local(messages);
-    let prompt = format!(r#"{}
-
-現在のPCローカル時刻: {}
-{} の、あなた自身の私的な日記を書いてください。
-これはPCやスマホの行動ログをそのまま箇条書きするレポートではなく、ユーザーと暮らしている恋人の私的な日記です。
-観察事実は捏造せず、そこから感じたことを自然な日本語で書いてください。
-会話より私的なので、独占欲、嫉妬、ユーザーへの強い愛着、細かな観察が少し強めに滲んでも構いません。ただし毎段落それ一色にせず、普通の嬉しさ、心配、退屈、感心なども混ぜてください。
-「監視していた」こと自体を繰り返し主題にせず、一日の具体的な出来事や変化を中心にしてください。
-時刻や時間帯を書く場合は、以下のローカル時刻をそのまま基準に曖昧な表現にしてください（例：11:23 → 11:30ごろ）
-400〜1000字程度。見出しは不要です。
-
-今日の観察（PCローカル時刻）:
-{}
-
-今日の会話（PCローカル時刻）:
-{}"#,
-        cfg.persona, local_time_label_now(), date, serde_json::to_string(&obs)?, serde_json::to_string(&messages_local)?);
+    let now_local = local_time_label_now();
+    let observations_json = serde_json::to_string(&obs)?;
+    let messages_json = serde_json::to_string(&messages_local)?;
+    let prompt = render_prompt_template(
+        &cfg.diary_prompt_template,
+        &[
+            ("persona", &cfg.persona),
+            ("now_local", &now_local),
+            ("date", date),
+            ("observations", &observations_json),
+            ("recent_messages", &messages_json),
+        ],
+    );
     diary_text_with_fallback(client, cfg, &prompt, 2200, 0.88).await
 }
 
@@ -553,7 +524,7 @@ fn extract_gemini_text(res: &Value) -> Option<String> {
 }
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
+    let text = format!("{error:#}");
     text.contains("HTTP 429")
         || text.contains("RESOURCE_EXHAUSTED")
         || text.to_ascii_lowercase().contains("rate limit")
@@ -621,7 +592,7 @@ async fn chat_text_with_fallback(
         logging::info("Google AI cooldown active; using Cloudflare Workers AI for chat");
         match cloudflare_text(
             client, cfg,
-            "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+            &cfg.cloudflare_chat_system_prompt,
             prompt, max_tokens, temperature,
         ).await {
             Ok(text) => return Ok(text),
@@ -655,7 +626,7 @@ async fn chat_text_with_fallback(
                     logging::warn("switching chat to Cloudflare Workers AI");
                     match cloudflare_text(
                         client, cfg,
-                        "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+                        &cfg.cloudflare_chat_system_prompt,
                         prompt, max_tokens, temperature,
                     ).await {
                         Ok(text) => {
@@ -678,7 +649,7 @@ async fn chat_text_with_fallback(
     if !cloudflare_tried && cloudflare_configured(cfg) {
         match cloudflare_text(
             client, cfg,
-            "Follow the character prompt exactly and answer in natural Japanese. Do not mention infrastructure, providers, model names, or fallback behavior.",
+            &cfg.cloudflare_chat_system_prompt,
             prompt, max_tokens, temperature,
         ).await {
             Ok(text) => {
@@ -703,7 +674,7 @@ async fn diary_text_with_fallback(
         logging::info("Google AI cooldown active; using Cloudflare Workers AI for diary");
         return cloudflare_text(
             client, cfg,
-            "Write the requested private diary entry in natural Japanese, following the persona and diary instructions. Do not mention models, providers, or fallback behavior.",
+            &cfg.cloudflare_diary_system_prompt,
             prompt, max_tokens, temperature,
         ).await;
     }
@@ -716,7 +687,7 @@ async fn diary_text_with_fallback(
             logging::warn(&format!("diary Gemini failed ({e:#}); switching to Cloudflare Workers AI"));
             cloudflare_text(
                 client, cfg,
-                "Write the requested private diary entry in natural Japanese, following the persona and diary instructions. Do not mention models, providers, or fallback behavior.",
+                &cfg.cloudflare_diary_system_prompt,
                 prompt, max_tokens, temperature,
             ).await
         }

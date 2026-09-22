@@ -1,13 +1,65 @@
 use crate::{config, db, llm, logging, models::{ActivitySnapshot, DiaryEntry}, rhythm, screenpipe, AppState};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, Local, Timelike, Utc};
-use std::{sync::{Arc, atomic::Ordering}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs, path::{Path, PathBuf}, sync::{Arc, atomic::Ordering}, time::{SystemTime, UNIX_EPOCH}};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration, Instant};
 
 const SCHEDULER_TICK_SECONDS: u64 = 15;
 const DIARY_RETRY_GAP_SECONDS: u64 = 5 * 60;
+
+#[derive(Clone, Copy)]
+enum DiaryGenerationKind {
+    Manual,
+    Automatic,
+}
+
+impl DiaryGenerationKind {
+    fn filename_tag(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "auto",
+        }
+    }
+}
+
+fn diary_archive_dir(data_dir: &Path, date: &str) -> PathBuf {
+    data_dir.join("diaries").join(date)
+}
+
+fn automatic_diary_already_archived(data_dir: &Path, date: &str) -> Result<bool> {
+    let dir = diary_archive_dir(data_dir, date);
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with("-auto.md") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn archive_diary(data_dir: &Path, local: chrono::DateTime<Local>, kind: DiaryGenerationKind, text: &str) -> Result<PathBuf> {
+    let date = local.format("%Y-%m-%d").to_string();
+    let dir = diary_archive_dir(data_dir, &date);
+    fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "{}-{:03}-{}.md",
+        local.format("%H%M%S"),
+        local.timestamp_subsec_millis(),
+        kind.filename_tag(),
+    );
+    let path = dir.join(filename);
+    fs::write(&path, format!("{}\n", text.trim_end()))?;
+    Ok(path)
+}
 
 fn next_observation_delay(cfg: &config::AppConfig) -> Duration {
     let min = cfg.observation_interval_min_seconds.max(60);
@@ -160,13 +212,24 @@ pub async fn maybe_make_diary(app: &AppHandle, state: &Arc<AppState>, cfg: &conf
     let reached = (local.hour(), local.minute()) >= (cfg.diary_hour, cfg.diary_minute);
     if !reached { return Ok(None); }
     let date = local.format("%Y-%m-%d").to_string();
-    if db::get_diary(&state.db_path, &date)?.is_some() { return Ok(None); }
-    let d = generate_diary_for_today(state, cfg).await?;
+    // Manual drafts must never suppress the scheduled 22:30 diary. The
+    // timestamped auto archive is the durable marker that today's automatic
+    // diary already completed, including across app restarts.
+    if automatic_diary_already_archived(&state.data_dir, &date)? { return Ok(None); }
+    let d = generate_diary_for_today_with_kind(state, cfg, DiaryGenerationKind::Automatic).await?;
     let _ = app.emit("diary_ready", &d);
     Ok(Some(d))
 }
 
 pub async fn generate_diary_for_today(state: &Arc<AppState>, cfg: &config::AppConfig) -> Result<DiaryEntry> {
+    generate_diary_for_today_with_kind(state, cfg, DiaryGenerationKind::Manual).await
+}
+
+async fn generate_diary_for_today_with_kind(
+    state: &Arc<AppState>,
+    cfg: &config::AppConfig,
+    kind: DiaryGenerationKind,
+) -> Result<DiaryEntry> {
     if rhythm::status(&state.data_dir)?.sleeping {
         return Err(anyhow!("{}は寝ています。起きてから日記を生成してください。", cfg.companion_name));
     }
@@ -179,6 +242,19 @@ pub async fn generate_diary_for_today(state: &Arc<AppState>, cfg: &config::AppCo
     let messages = db::recent_messages(&state.db_path, 80)?;
     let text = llm::diary(&state.http, cfg, &date, &observations, &messages).await?;
     let created_at = Utc::now().to_rfc3339();
+
+    // The database stores only today's latest diary for the GUI. Every
+    // generation is also archived as a separate Markdown file so manual drafts
+    // and the scheduled version are never lost. Save the DB first; if the file
+    // write fails, the automatic scheduler will retry because no -auto.md marker
+    // exists yet.
     db::save_diary(&state.db_path, &date, &created_at, &text)?;
+    let archived = archive_diary(&state.data_dir, local, kind, &text)?;
+    logging::info(&format!(
+        "diary archived ({}) at {}",
+        kind.filename_tag(),
+        archived.display()
+    ));
+
     Ok(DiaryEntry { date, created_at, text })
 }

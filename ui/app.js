@@ -26,6 +26,13 @@ function fillConfig(c) {
   $('cfg-interval-max').value = Math.round((c.observation_interval_max_seconds || 600) / 60);
   $('cfg-gap').value = c.minimum_notification_gap_minutes;
   $('cfg-persona').value = c.persona;
+  $('cfg-prompt-observation-system').value = c.observation_system_prompt || '';
+  $('cfg-prompt-observation').value = c.observation_prompt_template || '';
+  $('cfg-prompt-proactive').value = c.proactive_prompt_template || '';
+  $('cfg-prompt-chat').value = c.chat_prompt_template || '';
+  $('cfg-prompt-diary').value = c.diary_prompt_template || '';
+  $('cfg-prompt-cloudflare-chat').value = c.cloudflare_chat_system_prompt || '';
+  $('cfg-prompt-cloudflare-diary').value = c.cloudflare_diary_system_prompt || '';
 }
 function setHealthBadge(id, ok, goodText, badText) {
   const el = $(id);
@@ -215,7 +222,14 @@ $('save-settings').addEventListener('click', async () => {
     observation_interval_min_seconds:(Number($('cfg-interval-min').value) || 5) * 60,
     observation_interval_max_seconds:(Number($('cfg-interval-max').value) || 10) * 60,
     minimum_notification_gap_minutes:Number($('cfg-gap').value) || 20,
-    persona:$('cfg-persona').value
+    persona:$('cfg-persona').value,
+    observation_system_prompt:$('cfg-prompt-observation-system').value,
+    observation_prompt_template:$('cfg-prompt-observation').value,
+    proactive_prompt_template:$('cfg-prompt-proactive').value,
+    chat_prompt_template:$('cfg-prompt-chat').value,
+    diary_prompt_template:$('cfg-prompt-diary').value,
+    cloudflare_chat_system_prompt:$('cfg-prompt-cloudflare-chat').value,
+    cloudflare_diary_system_prompt:$('cfg-prompt-cloudflare-diary').value
   };
   try { await invoke('save_config', { newConfig:c }); data.config = c; fillConfig(c); toast('保存しました'); }
   catch(e) { toast(`保存エラー: ${e}`); }

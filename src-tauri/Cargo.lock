@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "yandere-companion"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "axum",

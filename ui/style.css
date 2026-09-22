@@ -70,3 +70,11 @@ button.compact { padding:5px 8px; border-radius:8px; font-size:10px; }
 .phone-card { border:1px solid #e1e5ee; background:#fafbfe; border-radius:12px; padding:10px 11px; display:flex; flex-direction:column; gap:7px; }
 .phone-meta { display:grid; grid-template-columns:62px 1fr; gap:8px; align-items:start; font-size:10px; color:#77656f; }
 .phone-meta code { font-size:9px; line-height:1.45; word-break:break-all; white-space:normal; color:#5b6070; user-select:text; }
+
+.prompt-editor { border:1px solid #eadfe5; background:#fcfafb; border-radius:12px; padding:9px 10px; }
+.prompt-editor summary { cursor:pointer; font-size:11px; font-weight:700; color:#68545f; user-select:none; }
+.prompt-editor[open] summary { margin-bottom:8px; }
+.prompt-editor label { margin-top:10px; }
+.prompt-editor textarea { min-height:88px; line-height:1.5; resize:vertical; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:11px; }
+.prompt-vars { margin:9px 0 -2px; }
+.prompt-vars code { user-select:text; }

@@ -78,6 +78,40 @@
       </div>
       <label>通知の最短間隔（分）<input id="cfg-gap" type="number" min="1" /></label>
       <label>人格<textarea id="cfg-persona" rows="11"></textarea></label>
+      <details class="prompt-editor">
+        <summary>プロンプトを編集</summary>
+        <p class="tiny">保存後すぐに次の会話・観察・通知・日記から使われます。<code>{{...}}</code> の変数は実行時に自動置換されるので、必要なものは消さずに残してください。</p>
+
+        <label>観察 system prompt（Google / Cloudflare共通）
+          <textarea id="cfg-prompt-observation-system" rows="5"></textarea>
+        </label>
+        <p class="tiny prompt-vars">観察テンプレート変数: <code>{{persona}}</code> <code>{{now_local}}</code> <code>{{window_local}}</code> <code>{{recent_observations}}</code> <code>{{snapshot}}</code></p>
+        <label>観察 prompt template
+          <textarea id="cfg-prompt-observation" rows="18"></textarea>
+        </label>
+
+        <p class="tiny prompt-vars">自発通知テンプレート変数: <code>{{persona}}</code> <code>{{now_local}}</code> <code>{{decision_summary}}</code> <code>{{decision_intent}}</code> <code>{{notification_hint}}</code> <code>{{recent_messages}}</code></p>
+        <label>自発通知 prompt template
+          <textarea id="cfg-prompt-proactive" rows="16"></textarea>
+        </label>
+
+        <p class="tiny prompt-vars">会話テンプレート変数: <code>{{persona}}</code> <code>{{now_local}}</code> <code>{{user_name}}</code> <code>{{companion_name}}</code> <code>{{observations}}</code> <code>{{recent_messages}}</code> <code>{{user_text}}</code></p>
+        <label>会話 prompt template
+          <textarea id="cfg-prompt-chat" rows="20"></textarea>
+        </label>
+
+        <p class="tiny prompt-vars">日記テンプレート変数: <code>{{persona}}</code> <code>{{now_local}}</code> <code>{{date}}</code> <code>{{observations}}</code> <code>{{recent_messages}}</code></p>
+        <label>日記 prompt template
+          <textarea id="cfg-prompt-diary" rows="16"></textarea>
+        </label>
+
+        <label>Cloudflare 会話 system prompt
+          <textarea id="cfg-prompt-cloudflare-chat" rows="4"></textarea>
+        </label>
+        <label>Cloudflare 日記 system prompt
+          <textarea id="cfg-prompt-cloudflare-diary" rows="4"></textarea>
+        </label>
+      </details>
       <div class="actions">
         <button id="observe-now" class="secondary">今すぐ観察</button>
         <button id="save-settings">保存</button>
